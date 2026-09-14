@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+.env
+.env.*
+work/
+outputs/
+*.log
+.amplifier/digital-twin-universe/
