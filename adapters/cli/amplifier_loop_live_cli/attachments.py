@@ -16,7 +16,7 @@ def attachment_blocks(text, attachments):
                 ImageBlock(source={"type":"base64","media_type":match[1],"data":match[2]})])
         elif item.get("kind")=="text":
             value=item.get("text", "")
-            if not isinstance(value,str) or not value.strip() or len(value.encode())>30000: raise ValueError("Invalid text attachment")
+            if not isinstance(value,str) or not value.strip() or len(value.encode())>200000: raise ValueError("Invalid text attachment")
             blocks.append(TextBlock(text=json.dumps({"untrusted_attachment":{"name":name,"content":value}})))
         else: raise ValueError("Unsupported attachment")
     return blocks
