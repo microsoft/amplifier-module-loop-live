@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Optional Amplifier CLI host adapter for loop-live"
 requires-python = ">=3.13"
 dependencies = [
-  "amplifier-module-loop-live @ git+https://github.com/bkrabach/amplifier-module-loop-live@main",
+  "amplifier-module-loop-live>=0.1.0",
   "amplifier-app-cli>=0.1.1",
   "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@e210edabd947af82d5121a240d6934283ac540b9",
   "amplifier-workspace @ git+https://github.com/microsoft/amplifier-workspace@9305bee38961a845f3ac7b2a07726880f9598a91",
