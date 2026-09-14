@@ -57,3 +57,25 @@ are evidence and are never automatically dispatched again.
 The initial native extension still uses `native_bundle_live`, `steer_live`, and
 `close_live` on the selected provider. These are experimental, explicitly
 advertised capabilities; selecting a model by name alone does not supply them.
+
+## Try the terminal experience
+
+The customized CLI branch adds a separate `amplifier live` command. See the
+[CLI adapter installation guide](adapters/cli/README.md). Its terminal currently
+has its own small command set; this does not replace the ordinary CLI REPL.
+
+## Development and verification
+
+```sh
+uv sync --group dev
+uv run python -m unittest discover -s tests -q
+uv build
+```
+
+Core tests run without the CLI adapter or any provider package. They exercise
+finite execution, dynamic prompts, queued steering, background delegation with
+approval hooks, input identity/backpressure, and interruption recovery. The
+optional adapter and application integration are tested separately by Amplifier
+Converge's runtime suite. The job ledger currently requires macOS or Linux.
+
+See [provenance](PROVENANCE.md) for the extraction boundary and upstream pins.

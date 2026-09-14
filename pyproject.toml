@@ -12,7 +12,12 @@ dependencies = [
 loop-live = "amplifier_module_loop_live:mount"
 
 [dependency-groups]
-dev = ["amplifier-core==1.6.1", "pytest>=8", "pytest-asyncio>=0.24"]
+dev = [
+  "amplifier-core==1.6.1",
+  "amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@2d1bdc4d9c1803491fe39820c8d503dd764d32de",
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+]
 
 [build-system]
 requires = ["hatchling"]

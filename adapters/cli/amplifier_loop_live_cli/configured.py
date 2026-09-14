@@ -1,4 +1,4 @@
-"""CLI-equivalent bundle preparation for a local Amplifier Converge manager process."""
+"""CLI-equivalent bundle preparation for a live Amplifier host process."""
 
 import copy
 import hashlib
@@ -212,7 +212,8 @@ because its last checkpoint contained an early queued receipt.
 
 
 async def prepare_manager(workspace, *, runtime=None, bundle=None, background_delegate=True,
-                          ask=None, report_dir=None, pin_provider=None, resume=False, selection=None, worker_settings=None):
+                          ask=None, report_dir=None, pin_provider=None, resume=False, selection=None, worker_settings=None,
+                          application_host="Amplifier Live CLI"):
     # Like the upstream CLI, this host owns a process and CWD. A future web host
     # must isolate these sessions in worker processes instead of os.chdir races.
     from amplifier_app_cli.lib.settings import AppSettings
@@ -261,7 +262,7 @@ async def prepare_manager(workspace, *, runtime=None, bundle=None, background_de
     report_dir = Path(report_dir or Path.home() / ".amplifier" / "converge-live" / runtime.session_id)
     write_report(report_dir / "baseline-mount-plan.json", baseline)
     write_report(report_dir / "live-mount-plan.json", plan)
-    plan.update(application_host="Amplifier Live CLI", root_session_id=runtime.session_id,
+    plan.update(application_host=application_host, root_session_id=runtime.session_id,
                 bundle_name=bundle, project_dir=str(workspace), project_name=workspace.name)
     approvals = ManagerApprovals(runtime, ask)
     APPROVAL_CHANNEL.set(approvals)
@@ -367,7 +368,7 @@ async def prepare_manager(workspace, *, runtime=None, bundle=None, background_de
         from amplifier_app_cli.session_spawner import _install_transcript_checkpoint
         metadata = {"session_id": runtime.session_id, "parent_id": None, "bundle_name": bundle,
                     "created": datetime.now(UTC).isoformat(), "working_dir": str(workspace),
-                    "application_host": "Amplifier Live CLI", "config": redacted(session.config)}
+                    "application_host": application_host, "config": redacted(session.config)}
         await _install_transcript_checkpoint(session, store, runtime.session_id, metadata)
         async def checkpoint(status="in_progress"):
             transcript = await session.coordinator.get("context").get_messages()
