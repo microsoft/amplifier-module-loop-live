@@ -14,8 +14,14 @@ from the core package.
 Use an isolated tool installation when evaluating alongside an existing CLI:
 
 ```sh
+# Match the reviewed foundation revision across the CLI and adapter metadata.
+cat > loop-live-overrides.txt <<'PINS'
+amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@e210edabd947af82d5121a240d6934283ac540b9
+PINS
+
 UV_TOOL_DIR="$PWD/.tools" UV_TOOL_BIN_DIR="$PWD/.bin" uv tool install \
-  --python 3.13 \
+  --python 3.13 --overrides loop-live-overrides.txt \
+  --with 'amplifier-module-loop-live @ git+https://github.com/bkrabach/amplifier-module-loop-live@main' \
   --with 'amplifier-core==1.6.1' \
   --with 'amplifier-loop-live-cli @ git+https://github.com/bkrabach/amplifier-module-loop-live@main#subdirectory=adapters/cli' \
   'git+https://github.com/bkrabach/amplifier-app-cli@loop-live'
@@ -53,3 +59,10 @@ Conventional providers accept updates at request boundaries. Existing
 computer-use compatibility repairs are retained in this adapter, not installed
 globally by the core module. They should become separately reviewed upstream
 changes before a stable community release.
+
+Saved PNG computer screenshots are expanded for both request-budget inspection
+and completion. The tested OpenAI model families count image patches separately
+from text; their base64 transport bytes must not masquerade as text tokens. The
+estimate retains a conservative text byte ceiling and image headroom. Other
+formats/models retain the upstream estimate. This is an optional adapter repair,
+not a change to the core loop or to the pixels/request sent to the provider.

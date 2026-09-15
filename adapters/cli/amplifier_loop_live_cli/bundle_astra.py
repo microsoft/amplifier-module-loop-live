@@ -20,6 +20,7 @@ from websockets.protocol import State
 from amplifier_core.message_models import ToolCall
 from amplifier_core.llm_errors import LLMError
 from amplifier_module_provider_openai import OpenAIProvider, _RawResponseObject
+from .image_budget import ImageBudgetMixin
 
 
 
@@ -35,7 +36,7 @@ def add_usage(total, usage):
             total[name] = total.get(name, 0) + value
 
 
-class SafeOpenAIProvider(OpenAIProvider):
+class SafeOpenAIProvider(ImageBudgetMixin, OpenAIProvider):
     @classmethod
     def wrap(cls, original):
         provider=cls.__new__(cls)
@@ -58,7 +59,7 @@ class SafeOpenAIProvider(OpenAIProvider):
             raise
 
 
-class BundleAstraProvider(OpenAIProvider):
+class BundleAstraProvider(ImageBudgetMixin, OpenAIProvider):
     native_bundle_live = True
 
     @classmethod
