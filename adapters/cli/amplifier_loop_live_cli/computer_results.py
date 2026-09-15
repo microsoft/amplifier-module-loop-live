@@ -17,7 +17,20 @@ def prepare_computer_provider(provider, coordinator):
     hook=sys.modules.get("amplifier_module_hook_computer_use")
     if hook is None or "computer" not in (coordinator.get("tools") or {}):return
     config=next((m.get("config",{}) for m in coordinator.config.get("hooks",[]) if m.get("module")=="hook-computer-use"),{})
-    hook._wrap_provider(provider,coordinator,int(config.get("max_inline_screenshots",3)))
+    limit=int(config.get("max_inline_screenshots",3))
+    hook._wrap_provider(provider,coordinator,limit)
+    # Newer providers serialize the request during context-budget preflight,
+    # before complete(). Give that observational path the same screenshot view
+    # as the mounted hook without mutating the request or saved transcript.
+    budget=getattr(provider,"request_budget",None)
+    if callable(budget) and getattr(provider,"_amplifier_computer_use_wrapped",False) and not getattr(provider,"_converge_computer_budget_wrapped",False):
+        def request_budget(request,**kwargs):
+            messages=getattr(request,"messages",None)
+            if isinstance(messages,list):
+                request=request.model_copy(update={"messages":hook._expand_tool_results(messages,limit)})
+            return budget(request,**kwargs)
+        provider.request_budget=request_budget
+        provider._converge_computer_budget_wrapped=True
 
 
 class ComputerResultError(LLMError):
