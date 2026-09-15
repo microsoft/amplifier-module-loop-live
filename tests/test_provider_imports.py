@@ -22,13 +22,20 @@ class ProviderImportsTests(unittest.TestCase):
                 (package / 'helper.py').write_text(helper)
             sys.path.insert(0, str(root / 'installed'))
             try:
-                module = imports.import_package(root / 'configured', name)
+                inspected = imports.import_package(root / 'installed', name)
+                self.assertTrue(inspected.old)
+                module = imports.import_package(root / 'configured', name, replace_inspected=True)
                 self.assertTrue(module.new)
                 self.assertEqual(Path(sys.modules[name + '.helper'].__file__).parent, root / 'configured' / name)
                 self.assertIs(imports.import_package(root / 'configured', name), module)
                 with self.assertRaisesRegex(RuntimeError, 'another source'):
                     imports.import_package(root / 'installed', name)
                 self.assertIs(sys.modules[name], module)
+                (root / 'installed' / name / '__init__.py').write_text('from . import helper\nraise ValueError("broken")')
+                with self.assertRaisesRegex(ValueError, 'broken'):
+                    imports.import_package(root / 'installed', name, replace_inspected=True)
+                self.assertIs(sys.modules[name], module)
+                self.assertTrue(sys.modules[name + '.helper'].new)
             finally:
                 sys.path.pop(0)
                 for key in tuple(sys.modules):
