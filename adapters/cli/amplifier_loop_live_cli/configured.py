@@ -282,6 +282,8 @@ async def prepare_manager(workspace, *, runtime=None, bundle=None, background_de
             transcript, recovered = jobs.recover(transcript or [])
         else:
             recovered = []
+        from .provider_imports import prepare_openai_import
+        await prepare_openai_import(prepared, plan)
         session = await prepared.create_session(session_id=runtime.session_id, session_cwd=workspace,
             approval_system=approvals, display_system=CLIDisplaySystem(), is_resumed=transcript is not None)
         if transcript is not None:
