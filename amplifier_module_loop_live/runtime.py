@@ -17,6 +17,28 @@ class Input:
     target: str | None = None
     attachments: tuple = ()
     call_id: str | None = None
+    # Host-private capability.  It is never serialized into context or exposed
+    # to providers; the loop binds it only while executing this input.
+    activation: object | None = field(default=None, compare=False, repr=False)
+
+
+class _Event(tuple):
+    """Keep tuple-compatible inbox events tied to their producing task."""
+
+    def __new__(cls, item, activation):
+        event = super().__new__(cls, item)
+        event.activation = activation
+        return event
+
+
+class _Inbox(asyncio.Queue):
+    def __init__(self, runtime):
+        super().__init__()
+        self.runtime = runtime
+
+    def put_nowait(self, item):
+        capture = self.runtime.capture_activation
+        super().put_nowait(_Event(item, capture() if capture else None))
 
 
 class Runtime:
@@ -26,7 +48,8 @@ class Runtime:
         self.session_id = session_id or str(uuid.uuid4())
         # Bound external input separately so tool/provider completion cannot deadlock
         # behind a full command queue during shutdown.
-        self.inbox = asyncio.Queue()
+        self.capture_activation = None
+        self.inbox = _Inbox(self)
         self.queued_inputs = 0
         self.events = []
         self.sequence = 0
@@ -36,6 +59,7 @@ class Runtime:
         self.changed = asyncio.Condition()
         self.closed = False
         self.max_input_chars = max_input_chars
+        self.generation = None
 
     async def submit(self, command: Input):
         if self.closed:
@@ -72,6 +96,24 @@ class Runtime:
         return command.id
 
     async def emit(self, event_type, **data):
+        # Optional portable generation correlation. A generation is one finite
+        # manager turn; it may finish while delegated jobs are still running.
+        if event_type == "generation.started":
+            self.generation = {"id": data["generation_id"], "input_ids": [], "accepted_input_ids": []}
+        generation = self.generation
+        if generation is not None:
+            if event_type in {"input.delivered", "steering.applied"}:
+                identity = data.get("input_id")
+                if identity and identity not in generation["input_ids"]:
+                    generation["input_ids"].append(identity)
+            elif event_type == "steering.accepted":
+                identity = data.get("input_id")
+                if identity and identity not in generation["accepted_input_ids"]:
+                    generation["accepted_input_ids"].append(identity)
+            if event_type in {"assistant.message", "generation.finished", "generation.failed", "generation.detached"}:
+                data["generation_id"] = generation["id"]
+                data["input_ids"] = list(generation["input_ids"])
+                data["accepted_input_ids"] = [identity for identity in generation["accepted_input_ids"] if identity not in generation["input_ids"]]
         self.sequence += 1
         event = {"version": 1, "sequence": self.sequence,
                  "session_id": self.session_id, "time": time.time(),
@@ -83,6 +125,8 @@ class Runtime:
             self.observer(copy.deepcopy(event))
         async with self.changed:
             self.changed.notify_all()
+        if event_type in {"generation.finished", "generation.failed", "generation.detached"}:
+            self.generation = None
         return event
 
     async def wait_for(self, predicate, timeout=30):
@@ -99,4 +143,3 @@ class Runtime:
 def observation(source, text, **metadata):
     # The provider's instruction message explicitly treats this envelope as data.
     return json.dumps({"observation": {"source": source, "text": text, **metadata}})
-
