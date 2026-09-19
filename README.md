@@ -54,6 +54,16 @@ approval policy, transport authentication, persistence location, and shutdown.
 Runtime history is bounded observation, not a replay log. Saved interrupted jobs
 are evidence and are never automatically dispatched again.
 
+Live responses carry generation and delivered-input identities, separate from
+provisional assistant content and native steering acceptance. See the
+[generation event contract](docs/generation-events.md) before using completion
+events to resolve a host request or send a notification.
+
+Hosts sharing session storage may supply optional `live.activation` and
+`live.park` capabilities to release ownership between turns while retaining
+mounted modules. See [host ownership](docs/host-ownership.md). These mechanisms
+do not choose a storage format or acquire a lock on the host's behalf.
+
 The initial native extension still uses `native_bundle_live`, `steer_live`, and
 `close_live` on the selected provider. These are experimental, explicitly
 advertised capabilities; selecting a model by name alone does not supply them.
@@ -68,7 +78,7 @@ has its own small command set; this does not replace the ordinary CLI REPL.
 
 ```sh
 uv sync --group dev
-uv run python -m unittest discover -s tests -q
+uv run pytest -q
 uv build
 ```
 

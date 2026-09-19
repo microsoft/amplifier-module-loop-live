@@ -228,3 +228,32 @@ class BundleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cancelled["call_id"], "cancel-me")
         self.assertEqual(cancelled["effects"], "not_rolled_back")
         self.assertFalse(any(e["type"] == "job.returned" for e in self.runtime.events))
+
+    async def test_generation_completion_correlates_delivered_input_after_tools(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "start", id="first"))
+        await self.provider.request()
+        await self.provider.reply("starting worker", [ToolCall(id="background", name="delegate", arguments={})])
+        await self.provider.request()
+        interim = [event for event in self.runtime.events if event["type"] == "assistant.message"]
+        self.assertTrue(interim)
+        self.assertFalse(any(event["type"] == "generation.finished" for event in self.runtime.events))
+        await self.runtime.submit(Input("steer", "new direction", id="correction"))
+        await self.provider.reply("pending")
+        await self.provider.request()
+        await self.provider.reply("Worker continues with the new direction.")
+        finished = await self.runtime.wait_for(lambda event: event["type"] == "generation.finished", 3)
+        self.assertEqual(finished["input_ids"], ["first", "correction"])
+        self.assertEqual(finished["text"], "Worker continues with the new direction.")
+        self.assertEqual(finished["active_job_ids"], [job_id for job_id, job in self.loop.jobs.items() if job["call_id"] == "background"])
+        self.assertEqual(finished["disposition"], "manager_turn_finished")
+        self.assertEqual(interim[0]["generation_id"], finished["generation_id"])
+
+    async def test_generation_failure_has_input_identity_without_success(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "start", id="first"))
+        await self.provider.request()
+        await self.provider.responses.put(RuntimeError("fixture failure"))
+        failed = await self.runtime.wait_for(lambda event: event["type"] == "generation.failed", 3)
+        self.assertEqual(failed["input_ids"], ["first"])
+        self.assertFalse(any(event["type"] == "generation.finished" for event in self.runtime.events))

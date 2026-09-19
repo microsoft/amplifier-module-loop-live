@@ -1,0 +1,29 @@
+name: Test core and package
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --group dev
+      - run: uv run --no-sync pytest -q
+      - run: uv build
+      - name: Check installed wheel without application adapters
+        run: |
+          uv venv "$RUNNER_TEMP/loop-live-smoke"
+          uv pip install --python "$RUNNER_TEMP/loop-live-smoke/bin/python" dist/*.whl amplifier-core==1.6.1
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/loop-live-smoke/bin/python" -I -c 'from amplifier_module_loop_live import mount; from amplifier_module_loop_live.runtime import Runtime, Input; import sys; assert not any(name.startswith(("amplifier_app_cli", "amplifier_loop_live_cli", "amplifier_live", "amplifier_web")) for name in sys.modules)'

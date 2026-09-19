@@ -1,4 +1,21 @@
-# Local extraction validation — September 14, 2026
+# Validation
+
+## Version 0.2.0 — September 19, 2026
+
+Against extraction base `bb9f5966d285ee4a93f4d84309aacf4bd9a09b5a`,
+the complete portable suite passes 39 tests. Coverage adds identified generation
+completion, delivered versus accepted inputs, provisional/final response
+separation, active delegates, and task-local ownership across parked sessions.
+Regression witnesses cover invalid input ownership failing explicitly and
+duplicate receipts surviving host reacquisition without replay.
+
+Source and wheel builds pass. The wheel installs and imports in a fresh
+environment outside the checkout without CLI/application adapters or provider
+SDK imports. CI repeats tests and the installed-wheel check on Linux and macOS
+with Python 3.11 and 3.13. These checks use real Core/context/streaming modules
+with fixture providers; no paid model or microphone test is implied.
+
+## Local extraction validation — September 14, 2026
 
 This is local development evidence, not an upstream compatibility certification.
 

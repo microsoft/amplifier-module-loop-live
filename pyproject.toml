@@ -1,6 +1,6 @@
 [project]
 name = "amplifier-module-loop-live"
-version = "0.1.0"
+version = "0.2.0"
 description = "Event-driven Amplifier sessions with identified input, background work, and finite-turn compatibility"
 readme = "README.md"
 requires-python = ">=3.11"
