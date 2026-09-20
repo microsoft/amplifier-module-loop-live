@@ -35,6 +35,10 @@ os._exit(91)
                 self.assertEqual(tool["tool_call_id"], "original-call")
                 self.assertEqual(tool["content"], "POST-HOOK-REPORT")
                 self.assertTrue(messages[0]["metadata"]["converge_native_async_calls"][0]["async"])
+                notice = next(m for m in messages if m["role"] == "user")
+                self.assertEqual(notice["metadata"]["amplifier_input"], {
+                    "version": 1, "kind": "service", "id": "original-job",
+                    "source": "local-job-recovery", "call_id": "original-call"})
                 again, recovered_again = ledger.recover(messages)
                 self.assertEqual(again, messages)
                 self.assertEqual(recovered_again, [])

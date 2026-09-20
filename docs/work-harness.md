@@ -1,13 +1,8 @@
-# Experimental portable work harness
+# Live execution contracts
 
-Compose `behaviors/work-local.yaml` over a configured Foundation bundle and resolve
-loop-live, context-managed and tool-transcript to the matching development
-checkouts. This profile is opt-in. It neither selects a provider nor replaces a
-running installation. Unified's host must use the matching development runtime.
-
-Eligible tools expose `async: true|false`. The default profile requires opt-in;
-older bundles with `background_delegate: true` retain their default, and an
-explicit false waits for completion. `background_tools` is an allowlist of tool
+Eligible tools expose `async: true|false`. Set it explicitly to select background
+execution or await completion. Hosts configured with `background_delegate: true`
+retain their existing default. `background_tools` is an allowlist of tool
 names whose implementations the host has checked for concurrent use. Only
 delegate is eligible by default. The original tool and approval hooks still run.
 
@@ -35,9 +30,3 @@ Still separate work: durable input deduplication beyond one runtime process,
 tree-wide budgets, a portable child collaboration service, managed process I/O,
 asynchronous clarification UI, and provider-native
 steering/collaboration. Request-boundary steering remains the portable guarantee.
-
-The matching Unified host implements `inherit_effective_model: true`: a child
-inherits the parent's explicit UI model and effort unless a provider preference,
-agent provider declaration, or model role supplies an override. Saved children
-retain the inherited selection on resume. Ordinary bundle defaults still inherit
-through the existing Foundation mount-plan composition.
