@@ -25,12 +25,15 @@ includes:
 The root includes five tools, including `delegate` and `read_transcript`. The
 behavior alone changes only the loop/context and adds transcript retrieval; it
 preserves the existing tools and provider configuration. Module sources use
-reviewed commit IDs, including merged loop-live `11a730a` and context-managed
+reviewed commit IDs, including loop-live `de307c3` (merged scheduling fix plus
+recovery provenance) and context-managed
 `5b0816e`. A host source override can still supersede a source: inspect Unified's
 effective configuration when comparing results.
 
 Unified v0.11.1 supplies the tested HTTP/SSE host contract; the adapter now pins
-v0.11.4 with the fresh-browser and empty-composer fixes. The profile also pins
+candidate `03f6c85` on v0.11.8, with voice intent, recovered-history presentation,
+and legacy provider restoration fixes. These candidate changes are in Unified
+PR #73; the published v0.11.8 alone does not contain them. The profile also pins
 the merged loop-live scheduling fix required by the real browser checks. Unified supplies passive
 conversation history and child model inheritance. These are host capabilities,
 not new tools installed into arbitrary hosts by this bundle. Plain finite hosts
@@ -101,6 +104,7 @@ uv sync --project adapters/unified --locked --group browser
 uv run --project adapters/unified --locked --group browser python -m playwright install chromium
 uv run --project adapters/unified --locked --group browser python adapters/unified/browser_acceptance.py \
   --allow-live --provider <configured-instance-id> \
+  --packaged-worker \
   --output /absolute/private/new-browser-run
 ```
 
@@ -110,6 +114,8 @@ a real pending child, visible public streaming, an offline browser during task
 completion, reconnection, and reload. Screenshots are saved for visual review.
 Authentication uses the isolated host's control token scoped to its local origin;
 this does not exercise PAM login. The app's security policy remains enabled.
+`--packaged-worker` uses Unified's normal isolated dependency environment. Without
+it, the worker runs in the adapter environment used by the earlier matrix.
 
 On macOS, add `--voice-audio` to feed explicitly synthetic speech through Chromium's
 microphone into the app's real voice connection. This uses `say` and `afconvert`,
@@ -118,13 +124,36 @@ It checks recognized speech reaching the working session, outbound/inbound audio
 packets and received audio energy, and accepted work surviving call end. It never
 records the physical microphone. The default `--voice-phrasing direct` uses the
 same correction as the text test. `--voice-phrasing forwarded` retains a naturally
-phrased forwarding request that exposed a correction-handling failure; see the
-validation report. Neither variant proves physical speaker output or spoken
+phrased forwarding request that exposed a correction-handling failure and now
+passes with the pinned host fix; see the validation report. Neither variant proves physical speaker output or spoken
 barge-in. Do not compare its elapsed time with text latency: the microphone file
 intentionally begins with 30 seconds of silence for connection establishment.
 
 Physical microphone/speaker use, interruption of spoken output, and additional
 browser/device combinations still require separate acceptance.
+
+## Start a persistent local preview
+
+The preview uses the normal packaged worker, authentication and filesystem tools.
+Its private settings, histories and workspace are separate from existing apps.
+It makes real provider calls. The chosen model remains unchanged; the primary
+provider's output is bounded to 8192 tokens for this test environment.
+
+```sh
+uv run --project adapters/unified --locked python adapters/unified/preview.py init \
+  --directory /absolute/private/new-preview --provider <configured-instance-id> \
+  --also-provider <another-configured-instance-id> --port 8956
+uv run --project adapters/unified --locked python adapters/unified/preview.py serve \
+  --directory /absolute/private/new-preview
+```
+
+Omit `--also-provider` for a single-provider preview. Open the printed localhost
+address and authenticate normally. Restarting `serve` preserves conversations;
+`init` refuses to overwrite an existing directory. New chats default to the Work
+profile. The synthetic workspace contains `delivery.txt` and a 45-second
+`collect_delivery.py` exercise. Ask for one background helper to run that script,
+then ask a side question or change the report while it waits. Closing the voice
+call should leave accepted work running. Explicitly stop a task to cancel it.
 
 The profile does not yet add durable compaction checkpoints, portable child-agent
 coordination, a shared asynchronous-question ledger, or managed process I/O.

@@ -4,7 +4,8 @@ The pinned profile is installable and the portable interaction works with real
 OpenAI and Anthropic providers in Unified. This establishes the tested execution
 contracts. Real Chromium interaction and compaction now pass as well. This does
 not establish ChatGPT quality parity, broad reliability, or physical microphone
-and speaker acceptance. A voice intent failure is retained below.
+and speaker acceptance. The earlier voice intent failure is retained below; the
+same forwarded request passes with the new host framing.
 
 ## Tested setup
 
@@ -16,7 +17,7 @@ and speaker acceptance. A voice intent failure is retained below.
   Its 49 offline tests and a fresh real-provider Terra compaction run passed all
   14 checks, including public streaming, successful summarization, private summary
   text, input retention and HTTP/SSE reconnect. Compaction took 6.769 s in that run.
-- The current adapter pins Unified v0.11.4 `9112dc3` and merged loop-live
+- The preceding adapter pinned Unified v0.11.4 `9112dc3` and merged loop-live
   `11a730a`. Browser runs used fix commit `171414e`, whose loop/test changes are
   identical to the separately merged scheduling correction (PR #5).
 - Core 1.6.1; Foundation `695f875`; initial API matrix loop-live `7a2a9b9`;
@@ -143,6 +144,44 @@ Test-helper failures are also retained separately: string polling conflicted wit
 the app's CSP; a Markdown `42.` list marker was invisible to a text-only locator;
 and an absent RTP statistic was represented as null. The helper fixes preserve
 CSP and recognize actual rendered output; none changes the app's results.
+
+## Packaged-worker candidate and persistent preview
+
+The current lock pins Unified candidate `03f6c85` (PR #73, based on v0.11.8)
+and loop-live `de307c3`. The latter adds service provenance for job recovery to
+the merged scheduling fix. The host adds explicit voice delivery context,
+read-only projection support for legacy recovery records, and unique
+same-family/same-model restoration of legacy provider IDs. Model and reasoning
+effort remain pinned; ambiguous mappings are rejected.
+
+All three new browser runs used the normal packaged worker environment, real
+providers, real Foundation children and the production frontend:
+
+| Scenario | Model | Result |
+|---|---|---|
+| Forwarded synthetic voice correction | Terra | 15/15 checks passed, including ORANGE retention, side answer during child work, real audio packets, call end, offline completion, reconnect, streaming and drafts |
+| Correction during visible compaction | Terra | 9/9 checks passed, including original objective, reference and correction retention |
+| Background child and typed correction | Opus | 11/11 checks passed, including verified stdout, exactly one execution, streaming, independent drafts and reconnect |
+
+The forwarded-voice run reuses the exact synthetic utterance from the earlier
+failed run. That failed evidence is retained; this acceptance pass does not
+establish general voice reliability or measure speech-response latency.
+
+A persistent preview uses the same installed candidate, normal authentication,
+packaged worker and a private synthetic workspace. Its real browser check passed
+7/7 checks: login required, actual file read, legacy `openai` selection restored
+to `terra` with the same model/effort, Work as the default bundle, response retained
+after reload, no browser errors and no alerts. Authentication for automation used
+an origin-scoped local control token; the actual PAM login remains a manual check.
+This fixture creates its own legacy selection; no real user session was modified.
+
+The Unified candidate passed 1,036 Python tests (11 opt-in skips), an additional
+12-check actual-worker/control run, 154 frontend tests, the production build and a
+Chromium recovery-presentation check. That browser check verifies collapsed
+service updates while identical user-typed text stays editable and attributed to
+the user. Core plus Foundation/adapter composition passed 50 tests; source and
+wheel packages built. These are correctness and integration checks, not a model
+quality benchmark.
 
 ## Still unverified
 

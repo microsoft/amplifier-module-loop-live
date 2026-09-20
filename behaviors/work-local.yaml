@@ -8,7 +8,7 @@ bundle:
 session:
   orchestrator:
     module: loop-live
-    source: git+https://github.com/bkrabach/amplifier-module-loop-live@11a730ac24463cb5bea8bd65385f494aa8f0f454
+    source: git+https://github.com/bkrabach/amplifier-module-loop-live@de307c398facea5d4d656e14f84938a74b934ff2
     config:
       background_delegate: false
       background_tools: [delegate]

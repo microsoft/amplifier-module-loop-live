@@ -87,6 +87,7 @@ async def run(args):
               "provider_instance": args.provider, "model": provider["config"].get("default_model"),
               "installed": installed_revisions(), "bundle_sha256": digest,
               "evidence": "real Chromium UI, provider and isolated Unified worker",
+              "runtime_environment": "packaged" if args.packaged_worker else "adapter",
               "authentication": "origin-scoped local control token; PAM login not tested",
               "audio": "synthetic microphone, real transport" if args.voice_audio else "not tested",
               "voice_phrasing": args.voice_phrasing if args.voice_audio else None,
@@ -95,7 +96,8 @@ async def run(args):
     app = await create_app(folder / "app", workspace=folder / "workspace",
                            voice=args.voice_audio, background_updates=False, preload_providers=False)
     service = app["service"]
-    service.runtime.command = [sys.executable, str(Path(worker.__file__).resolve())]
+    if not args.packaged_worker:
+        service.runtime.command = [sys.executable, str(Path(worker.__file__).resolve())]
     original = service.on_runtime_event
 
     async def observed(kind, data):
@@ -279,6 +281,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scenario", choices=("interaction", "compaction"), default="interaction")
     parser.add_argument("--voice-audio", action="store_true")
+    parser.add_argument("--packaged-worker", action="store_true", help="Use the app's normal independently installed worker environment")
     parser.add_argument("--voice-phrasing", choices=("direct", "forwarded"), default="direct")
     args = parser.parse_args()
     args.profile = "work"
