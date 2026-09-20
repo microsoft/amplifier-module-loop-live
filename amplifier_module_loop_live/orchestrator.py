@@ -18,6 +18,7 @@ from .provenance import InputContext, input_metadata
 from .job_store import serialize_result
 from .host import HostAdapter, AttachmentContext
 from .scope import HOST_ADAPTER
+from .dispatch import ApprovedDispatch
 
 _WAKE = "[loop-live inbox wake]"
 
@@ -31,6 +32,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         self.load_failures = []
         self.running = False
         self.root_provider = None
+        self.approved_dispatch = ApprovedDispatch(self)
 
     def _select_provider(self, providers):
         return self.root_provider or super()._select_provider(providers)
@@ -88,7 +90,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         token = HOST_ADAPTER.set(self.host)
         try:
             runtime, providers, finite_scope = await self.host.prepare_execution(self, coordinator, providers)
-            return await self._execute_live(prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope)
+            with self.approved_dispatch.run_scope(coordinator):
+                return await self._execute_live(prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope)
         finally:
             HOST_ADAPTER.reset(token)
 
@@ -337,6 +340,13 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             job["task"].cancel()
 
     async def _execute_tool_only(self, tool_call, tools, hooks, parallel_group_id, coordinator=None):
+        if not self.approved_dispatch.enabled:
+            return await self._execute_tool_scoped(tool_call, tools, hooks, parallel_group_id, coordinator)
+        tools = self.approved_dispatch.wrap_tools(tools)
+        with self.approved_dispatch.call_scope(tool_call, tools, hooks, parallel_group_id):
+            return await self._execute_tool_scoped(tool_call, tools, hooks, parallel_group_id, coordinator)
+
+    async def _execute_tool_scoped(self, tool_call, tools, hooks, parallel_group_id, coordinator=None):
         arguments = tool_call.arguments or {}
         eligible = tool_call.name in self.config.get("background_tools", ["delegate"])
         default = bool(self.config.get("background_delegate") and tool_call.name == "delegate")
@@ -420,6 +430,7 @@ async def mount(coordinator, config=None):
     loop = BundleLiveOrchestrator(config)
     await coordinator.mount("orchestrator", loop)
     coordinator.register_capability("session.steer", loop.steer)
+    coordinator.register_capability("tools.dispatch", loop.approved_dispatch)
     coordinator.register_capability("conversation.provider_pin", ConversationProviderPin(loop, coordinator))
     async def failed(event, data):
         loop.load_failures.append({"module": data.get("module_id"), "type": data.get("module_type")})
