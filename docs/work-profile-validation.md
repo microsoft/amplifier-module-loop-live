@@ -147,7 +147,7 @@ CSP and recognize actual rendered output; none changes the app's results.
 
 ## Packaged-worker candidate and persistent preview
 
-The current lock pins Unified candidate `03f6c85` (PR #73, based on v0.11.8)
+The first persistent preview pinned Unified candidate `03f6c85` (PR #73, based on v0.11.8)
 and loop-live `de307c3`. The latter adds service provenance for job recovery to
 the merged scheduling fix. The host adds explicit voice delivery context,
 read-only projection support for legacy recovery records, and unique
@@ -182,6 +182,22 @@ service updates while identical user-typed text stays editable and attributed to
 the user. Core plus Foundation/adapter composition passed 50 tests; source and
 wheel packages built. These are correctness and integration checks, not a model
 quality benchmark.
+
+The adapter now supersedes that preview pin with `b8eaa37` on v0.11.9. It includes
+the reviewed `10a1bd5` canvas-retention hotfix (merged in Unified PR #75). The
+voice, provider-selection, history-projection and worker source files are
+unchanged from the candidate used for the three paid browser scenarios above.
+The combined source passed 1,042 Python tests (11 skips), all 154 frontend tests,
+the recovered-history browser check and package build. The isolated preview was
+backed up and updated only while idle; canonical transcript hashes and all saved
+client drafts/attachments matched across the update. Earlier v0.11.8 candidates
+should not be used for durable canvas work.
+
+The running upgraded preview retained a synthetic canvas body through 75 seconds
+of normal client actions (crossing the maintenance interval), then through a
+second restart. Two independent client drafts also survived. Reopening the
+artifact succeeded through the API and its exact marker was visible in Chromium.
+Existing user transcripts and client draft/attachment records remained unchanged.
 
 ## Still unverified
 

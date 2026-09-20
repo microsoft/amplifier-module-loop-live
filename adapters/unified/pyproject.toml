@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
   "amplifier-core==1.6.1",
-  "amplifier-unified @ git+https://github.com/bkrabach/amplifier-unified@03f6c8586c341f3be21cfbc3c800d5366e03fe25",
+  "amplifier-unified @ git+https://github.com/bkrabach/amplifier-unified@b8eaa37f3d07a1994025be73bb5336b7937fba03",
   "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@695f875c0908f45f8dc78b1fcde80ecddebffd7c",
   "amplifier-module-loop-live @ git+https://github.com/bkrabach/amplifier-module-loop-live@de307c398facea5d4d656e14f84938a74b934ff2",
   "amplifier-module-context-managed @ git+https://github.com/microsoft/amplifier-bundle-context-managed@5b0816edb8761dc0ad38719ae59b4ee40808b36a#subdirectory=modules/context-managed",

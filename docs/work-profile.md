@@ -31,9 +31,11 @@ recovery provenance) and context-managed
 effective configuration when comparing results.
 
 Unified v0.11.1 supplies the tested HTTP/SSE host contract; the adapter now pins
-candidate `03f6c85` on v0.11.8, with voice intent, recovered-history presentation,
+candidate `b8eaa37` on v0.11.9, with voice intent, recovered-history presentation,
 and legacy provider restoration fixes. These candidate changes are in Unified
-PR #73; the published v0.11.8 alone does not contain them. The profile also pins
+PR #73; the published release alone does not contain them. This candidate also
+includes the v0.11.9 resource-retention hotfix; do not use earlier preview pins
+for durable canvas work. The profile also pins
 the merged loop-live scheduling fix required by the real browser checks. Unified supplies passive
 conversation history and child model inheritance. These are host capabilities,
 not new tools installed into arbitrary hosts by this bundle. Plain finite hosts
