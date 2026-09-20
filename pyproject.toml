@@ -5,7 +5,8 @@ description = "Event-driven Amplifier sessions with identified input, background
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "amplifier-module-loop-streaming @ git+https://github.com/microsoft/amplifier-module-loop-streaming@2feefe4ba0c4cb50fc0c6b33648a8ef6a2908820",
+  "jsonschema>=4.23,<5",
+  "amplifier-module-loop-streaming @ git+https://github.com/microsoft/amplifier-module-loop-streaming@603aa6eefacd28367fc886d58eb89de993c58dea",
 ]
 
 [project.entry-points."amplifier.modules"]
@@ -14,7 +15,7 @@ loop-live = "amplifier_module_loop_live:mount"
 [dependency-groups]
 dev = [
   "amplifier-core==1.6.1",
-  "amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@2d1bdc4d9c1803491fe39820c8d503dd764d32de",
+  "amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@2bc8b15770f4ecb49bd6216a8b5336e9c36adfc6",
   "pytest>=8",
   "pytest-asyncio>=0.24",
 ]

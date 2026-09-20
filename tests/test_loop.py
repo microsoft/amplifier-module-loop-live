@@ -48,6 +48,75 @@ class Delegate:
         return ToolResult(success=True, output={"report": "CHILD-RESULT"})
 
 class BundleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compaction_accepts_input_and_continues_same_task(self):
+        try:
+            from amplifier_module_context_managed.boundary import mount_boundary
+        except ImportError:
+            self.skipTest("Install the matching context-managed development module for this integration test")
+        await self.start(manager=False)
+        coordinator = self.session.coordinator
+        coordinator.register_capability("live.runtime", self.runtime)
+        await mount_boundary(coordinator, {"max_tokens": 6000, "summarize_trigger": 0.2})
+        context = coordinator.get("context")
+        original = [{"role": "user", "content": "ORIGINAL TASK"},
+            {"role": "assistant", "content": "Evidence " * 2400},
+            {"role": "user", "content": "Keep working"}, {"role": "assistant", "content": "In progress"}]
+        await context.set_messages(original)
+        self.task = asyncio.create_task(self.session.execute(""))
+        await self.runtime.wait_for(lambda e: e["type"] == "session.ready", 3)
+        await self.runtime.submit(Input("user", "Continue"))
+        summary_request = await self.provider.request()
+        self.assertEqual(summary_request.metadata["purpose"], "context-compaction")
+        await self.runtime.submit(Input("steer", "CORRECTION DURING COMPACTION", id="during-compact"))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "during-compact", 3)
+        await self.provider.reply("Original task remains active; research gathered; work remains.")
+        await self.provider.request()
+        await self.provider.reply("Continuing the task")
+        request = await self.provider.request()
+        self.assertIn("CORRECTION DURING COMPACTION", str(request.messages))
+        self.assertIn("ORIGINAL TASK", str(await context.get_messages()))
+        await self.provider.reply("Updated result")
+
+    async def test_explicit_async_opt_in_and_wait_wakes_on_user_input(self):
+        await self.start()
+        self.loop.config["background_delegate"] = False
+        await self.runtime.submit(Input("user", "background task"))
+        await self.provider.request()
+        await self.provider.reply(calls=[ToolCall(id="opt-in", name="delegate", arguments={"async": True})])
+        request = await self.provider.request()
+        self.assertIn("job_id", str(request.messages))
+        job_id = next(iter(self.loop.jobs))
+        await self.provider.reply(calls=[ToolCall(id="wait-job", name="live_job", arguments={"action": "wait", "job_id": job_id, "timeout": 60})])
+        await self.runtime.wait_for(lambda e: e["type"] == "tool.pre" and e.get("tool") == "live_job", 3)
+        await self.runtime.submit(Input("steer", "NEW REQUIREMENT", id="correction"))
+        request = await self.provider.request()
+        self.assertIn("NEW REQUIREMENT", str(request.messages))
+        self.assertIn("input_pending", str(request.messages))
+        self.assertEqual(self.tool.calls, 1)
+        await self.provider.reply("accepted correction")
+
+    async def test_explicit_sync_overrides_legacy_background_default(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "finite delegate"))
+        await self.provider.request()
+        await self.provider.reply(calls=[ToolCall(id="sync", name="delegate", arguments={"async": False})])
+        await self.runtime.wait_for(lambda e: e["type"] == "tool.pre", 3)
+        self.assertEqual(self.loop.jobs, {})
+        self.tool.release.set()
+        request = await self.provider.request()
+        self.assertIn("CHILD-RESULT", str(request.messages))
+        await self.provider.reply("done")
+
+    async def test_only_public_text_streams_and_compaction_stream_is_suppressed(self):
+        await self.start()
+        hooks = self.session.coordinator.hooks
+        for kind in ("text", "thinking", "tool_use"):
+            await hooks.emit("llm:stream_block_delta", {"block_type": kind, "text": kind})
+        self.session.coordinator.register_capability("context.compacting", lambda: True)
+        await hooks.emit("llm:stream_block_delta", {"block_type": "text", "text": "private summary"})
+        events = [e for e in self.runtime.events if e["type"] == "assistant.delta"]
+        self.assertEqual([e["text"] for e in events], ["text"])
+
     async def start(self, *, manager=True):
         self.runtime = Runtime()
         self.session = AmplifierSession({"session": {
