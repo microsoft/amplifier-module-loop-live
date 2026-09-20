@@ -29,7 +29,8 @@ reviewed commit IDs, including merged loop-live `7a2a9b9` and context-managed
 `5b0816e`. A host source override can still supersede a source: inspect Unified's
 effective configuration when comparing results.
 
-Unified v0.11.1 is the tested HTTP/SSE host contract. It supplies passive
+Unified v0.11.1 supplies the tested HTTP/SSE host contract; the adapter now pins
+v0.11.2 with the fresh-browser startup fix. Unified supplies passive
 conversation history and child model inheritance. These are host capabilities,
 not new tools installed into arbitrary hosts by this bundle. Plain finite hosts
 still run finite turns; installing YAML alone does not create a concurrent UI.

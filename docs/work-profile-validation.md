@@ -10,6 +10,11 @@ microphone/browser acceptance.
 - Unified v0.11.1, merged `6e9db3e07516af13c352292fed7843eed363cff2`.
   Initial interaction runs used candidate `9ba0ca5`; the merge changes only a
   validation document relative to that candidate, not application code.
+- The final adapter lock targets released v0.11.2,
+  `93e5d5d48ecb61401b84d248ffa9a64fc5f8fee9`, which fixes fresh-browser startup.
+  Its 49 offline tests and a fresh real-provider Terra compaction run passed all
+  14 checks, including public streaming, successful summarization, private summary
+  text, input retention and HTTP/SSE reconnect. Compaction took 6.769 s in that run.
 - Core 1.6.1; Foundation `695f875`; loop-live `7a2a9b9`;
   loop-streaming `603aa6e`; context-simple `2bc8b15`;
   context-managed/tool-transcript `5b0816e`.
@@ -36,7 +41,7 @@ microphone/browser acceptance.
 | Ordinary context baseline | Terra | Passed | Same retained facts and correction, HTTP/SSE reconnect and draft isolation |
 | Ordinary context baseline | Opus | Passed on repeat | One earlier reconnect history-read failure is retained below |
 
-The final locked-environment voice adapter/cross-chat run passed 16 checks. Its
+The locked-environment voice adapter/cross-chat run passed 16 checks. Its
 side answer arrived in 3.844 s while the child remained gated. Fresh text streaming
 was visible in eight SSE snapshots. This is transport evidence, not a visual
 review of the browser or a voice-audio latency measurement.
