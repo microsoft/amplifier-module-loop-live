@@ -16,13 +16,13 @@ Use an isolated tool installation when evaluating alongside an existing CLI:
 ```sh
 # Match the reviewed foundation revision across the CLI and adapter metadata.
 cat > loop-live-overrides.txt <<'PINS'
-amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@e210edabd947af82d5121a240d6934283ac540b9
+amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main
 PINS
 
 UV_TOOL_DIR="$PWD/.tools" UV_TOOL_BIN_DIR="$PWD/.bin" uv tool install \
   --python 3.13 --overrides loop-live-overrides.txt \
   --with 'amplifier-module-loop-live @ git+https://github.com/bkrabach/amplifier-module-loop-live@main' \
-  --with 'amplifier-core==1.6.1' \
+  --with 'amplifier-core>=1.6.1' \
   --with 'amplifier-loop-live-cli @ git+https://github.com/bkrabach/amplifier-module-loop-live@main#subdirectory=adapters/cli' \
   'git+https://github.com/bkrabach/amplifier-app-cli@loop-live'
 

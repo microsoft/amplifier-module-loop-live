@@ -25,7 +25,7 @@ wheels = [
 [[package]]
 name = "amplifier-module-context-simple"
 version = "1.0.0"
-source = { git = "https://github.com/microsoft/amplifier-module-context-simple?rev=2bc8b15770f4ecb49bd6216a8b5336e9c36adfc6#2bc8b15770f4ecb49bd6216a8b5336e9c36adfc6" }
+source = { git = "https://github.com/microsoft/amplifier-module-context-simple?rev=main#5055ddc98c46df575c16d6f8bb751c7a1306b69d" }
 
 [[package]]
 name = "amplifier-module-loop-live"
@@ -46,14 +46,14 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "amplifier-module-loop-streaming", git = "https://github.com/microsoft/amplifier-module-loop-streaming?rev=603aa6eefacd28367fc886d58eb89de993c58dea" },
+    { name = "amplifier-module-loop-streaming", git = "https://github.com/microsoft/amplifier-module-loop-streaming?rev=main" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "amplifier-core", specifier = "==1.6.1" },
-    { name = "amplifier-module-context-simple", git = "https://github.com/microsoft/amplifier-module-context-simple?rev=2bc8b15770f4ecb49bd6216a8b5336e9c36adfc6" },
+    { name = "amplifier-core", specifier = ">=1.6.1" },
+    { name = "amplifier-module-context-simple", git = "https://github.com/microsoft/amplifier-module-context-simple?rev=main" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
 ]
@@ -61,7 +61,7 @@ dev = [
 [[package]]
 name = "amplifier-module-loop-streaming"
 version = "1.0.0"
-source = { git = "https://github.com/microsoft/amplifier-module-loop-streaming?rev=603aa6eefacd28367fc886d58eb89de993c58dea#603aa6eefacd28367fc886d58eb89de993c58dea" }
+source = { git = "https://github.com/microsoft/amplifier-module-loop-streaming?rev=main#9e5d4ff07c7f57fbdf233b869d94e18c910d83b9" }
 
 [[package]]
 name = "annotated-types"

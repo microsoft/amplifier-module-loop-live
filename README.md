@@ -6,7 +6,7 @@ and manage background delegation. Without a live runtime, execution returns a
 normal finite result. Provider-native steering is optional; other providers
 receive updates at request boundaries.
 
-This is an experimental extraction from Amplifier Converge. It retains a pinned
+This is an experimental extraction from Amplifier Converge. It follows the
 dependency on loop-streaming's implementation and is not yet a stable community
 API. The optional CLI adapter has separate dependencies and packaging under
 `adapters/cli`; importing the core never imports that adapter or either app.
@@ -88,4 +88,4 @@ approval hooks, input identity/backpressure, and interruption recovery. The
 optional adapter and application integration are tested separately by Amplifier
 Converge's runtime suite. The job ledger currently requires macOS or Linux.
 
-See [provenance](PROVENANCE.md) for the extraction boundary and upstream pins.
+See [provenance](PROVENANCE.md) for the extraction boundary and upstream dependencies.
