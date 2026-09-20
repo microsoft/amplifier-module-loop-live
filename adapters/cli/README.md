@@ -66,3 +66,14 @@ from text; their base64 transport bytes must not masquerade as text tokens. The
 estimate retains a conservative text byte ceiling and image headroom. Other
 formats/models retain the upstream estimate. This is an optional adapter repair,
 not a change to the core loop or to the pixels/request sent to the provider.
+
+Native Responses transport now comes from the configured OpenAI provider's
+optional `native.NativeResponsesProvider` module. The CLI binds its current
+live owner, private diagnostics, image budget, and computer-result policy; it
+no longer maintains a second wire protocol. Existing native enablement behavior
+is preserved for eligible models. Install the matching provider source during
+review; both packages continue to follow their existing `@main` sources after
+merge. An already wrapped driver retains ordinary transport rather than bypassing
+its instance-level wrapper. A queued correction is reported applied only after
+its successor response. Accepted-then-failed steering stops for explicit recovery
+instead of inserting the same canonical input twice.
