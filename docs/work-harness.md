@@ -1,9 +1,9 @@
 # Experimental portable work harness
 
-Compose `behaviors/work-local.yaml` over a configured Foundation bundle and resolve
-loop-live, context-managed and tool-transcript to the matching development
-checkouts. This profile is opt-in. It neither selects a provider nor replaces a
-running installation. Unified's host must use the matching development runtime.
+Compose the pinned `behaviors/work-local.yaml` over a configured Foundation bundle,
+or select the small root `bundle.md`. This profile is opt-in and provider-neutral.
+See [installation and live acceptance](work-profile.md) for sources, the tested
+Unified host, reproducible scenarios and validation limits.
 
 Eligible tools expose `async: true|false`. The default profile requires opt-in;
 older bundles with `background_delegate: true` retain their default, and an

@@ -1,4 +1,5 @@
 .venv/
+.profile-venv/
 .tools/
 .bin/
 __pycache__/

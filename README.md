@@ -11,6 +11,10 @@ dependency on loop-streaming's implementation and is not yet a stable community
 API. The optional CLI adapter has separate dependencies and packaging under
 `adapters/cli`; importing the core never imports that adapter or either app.
 
+The opt-in [Work profile](docs/work-profile.md) supplies a pinned bundle and
+real-provider acceptance scenarios for Unified, including conversation during
+delegation, visible compaction, cancellation and the voice-to-work handoff.
+
 ## Install
 
 Install into an Amplifier host environment (amplifier-core is a peer dependency):

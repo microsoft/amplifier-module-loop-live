@@ -6,6 +6,18 @@ on:
 permissions:
   contents: read
 jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv .profile-venv
+      - run: uv pip install --python .profile-venv/bin/python pytest pytest-asyncio 'amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@695f875c0908f45f8dc78b1fcde80ecddebffd7c'
+      - run: .profile-venv/bin/python -m pytest -q tests/test_work_profile.py
+      # Live acceptance is explicitly opt-in; CI never mounts user credentials.
   test:
     strategy:
       matrix:

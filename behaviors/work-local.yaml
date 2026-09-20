@@ -1,13 +1,14 @@
 bundle:
   name: work-local
-  version: 0.1.0
-  description: Experimental portable live work profile; install the matching local modules first.
+  version: 0.2.0
+  description: Opt-in Work profile with pinned live execution, boundary context, and transcript retrieval.
 
 # No model/provider override: experiments keep the user's chosen provider.
-# During development resolve these module names to the matching local worktrees.
+# Sources are reviewed commits; hosts still own credentials and live transport.
 session:
   orchestrator:
     module: loop-live
+    source: git+https://github.com/bkrabach/amplifier-module-loop-live@7a2a9b9ed0ddf2f1927f5d0e7aba42698c1e4c8d
     config:
       background_delegate: false
       background_tools: [delegate]
@@ -15,6 +16,7 @@ session:
       inherit_effective_model: true
   context:
     module: context-managed
+    source: git+https://github.com/microsoft/amplifier-bundle-context-managed@5b0816edb8761dc0ad38719ae59b4ee40808b36a#subdirectory=modules/context-managed
     config:
       engine: boundary
       token_meter: actual
@@ -24,3 +26,4 @@ session:
 
 tools:
   - module: tool-transcript
+    source: git+https://github.com/microsoft/amplifier-bundle-context-managed@5b0816edb8761dc0ad38719ae59b4ee40808b36a#subdirectory=modules/tool-transcript
