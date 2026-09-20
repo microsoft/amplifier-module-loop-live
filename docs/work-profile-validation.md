@@ -196,7 +196,7 @@ should not be used for durable canvas work.
 The running upgraded preview retained a synthetic canvas body through 75 seconds
 of normal client actions (crossing the maintenance interval), then through a
 second restart. Two independent client drafts also survived. Reopening the
-artifact succeeded through the API and its exact marker was visible in Chromium.
+artifact succeeded through the API. Visual reopening is being checked separately.
 Existing user transcripts and client draft/attachment records remained unchanged.
 
 ## Still unverified
