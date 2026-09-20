@@ -129,6 +129,51 @@ async def test_duplicate_receipt_survives_host_reacquisition_without_requeue():
 
 
 @pytest.mark.asyncio
+async def test_host_cannot_park_between_dequeue_and_turn_start():
+    ownership = Ownership()
+    first = ownership.activate()
+
+    async def park(*, activation):
+        pass
+
+    async with manager(ownership, park) as live:
+        event_loop = asyncio.get_running_loop()
+        previous_factory = event_loop.get_task_factory()
+        parking_attempts = []
+
+        def control_finished():
+            # Model a host control finishing before the newly scheduled turn
+            # gets its first execution slice. These are the host's idle checks.
+            loop = live.session.coordinator.get("orchestrator")
+            idle = not (live.runtime.queued_inputs or not live.runtime.inbox.empty()
+                        or loop.pending or loop._active_jobs() or live.runtime.generation)
+            parking_attempts.append(idle)
+            if idle:
+                ownership.release(first)
+
+        def schedule(loop, coroutine, **kwargs):
+            if coroutine.cr_code.co_name == "turn":
+                loop.call_soon(control_finished)
+            if previous_factory:
+                return previous_factory(loop, coroutine, **kwargs)
+            return asyncio.Task(coroutine, loop=loop, **kwargs)
+
+        event_loop.set_task_factory(schedule)
+        try:
+            await live.runtime.submit(Input("user", "first after idle", id="one", activation=first))
+            await live.provider.request()
+            assert parking_attempts == [False]
+            await live.provider.reply("completed with ownership")
+            await live.runtime.wait_for(lambda event: event["type"] == "generation.finished", 3)
+            starts = [e for e in live.runtime.events if e["type"] == "generation.started"]
+            assert len(starts) == 1
+            assert starts[0]["initial_input_id"] == "one"
+            assert live.checkpoints == [(first, None)]
+        finally:
+            event_loop.set_task_factory(previous_factory)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command_activation", [None, object()])
 async def test_bad_command_activation_fails_explicitly_without_hanging(command_activation):
     ownership = Ownership()

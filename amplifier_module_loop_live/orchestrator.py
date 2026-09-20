@@ -165,8 +165,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             try:
                 if activation:
                     activation_token = activation.bind(command.activation)
-                await runtime.emit("generation.started", generation_id=str(uuid.uuid4()),
-                                   initial_input_id=command.id, call_id=command.call_id)
                 await self._synchronize_job_results(context)
                 await runtime.emit("input.delivered", input_id=command.id,
                                    delivery="new_turn", source=command.source)
@@ -199,7 +197,12 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 self.pending.append(Input("user", prompt))
             while True:
                 if active is None and self.pending and runtime.inbox.empty():
-                    active = asyncio.create_task(turn(self.pending.popleft()))
+                    command = self.pending.popleft()
+                    # Publish busy state before scheduling: a host control can
+                    # otherwise park after dequeue but before turn() first runs.
+                    await runtime.emit("generation.started", generation_id=str(uuid.uuid4()),
+                                       initial_input_id=command.id, call_id=command.call_id)
+                    active = asyncio.create_task(turn(command))
                     idle = False
                 if active is None and not self.pending and not self._active_jobs() and runtime.inbox.empty() and not idle:
                     idle = True
