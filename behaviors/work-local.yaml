@@ -1,0 +1,26 @@
+bundle:
+  name: work-local
+  version: 0.1.0
+  description: Experimental portable live work profile; install the matching local modules first.
+
+# No model/provider override: experiments keep the user's chosen provider.
+# During development resolve these module names to the matching local worktrees.
+session:
+  orchestrator:
+    module: loop-live
+    config:
+      background_delegate: false
+      background_tools: [delegate]
+      max_background_jobs: 4
+      inherit_effective_model: true
+  context:
+    module: context-managed
+    config:
+      engine: boundary
+      token_meter: actual
+      summarize_trigger: 0.70
+      summary_target_tokens: 1500
+      summary_timeout: 120
+
+tools:
+  - module: tool-transcript

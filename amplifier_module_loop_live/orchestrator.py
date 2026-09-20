@@ -105,6 +105,16 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             raise RuntimeError("One execute owner per manager session")
         self.running, self.runtime = True, runtime
         self.context, self.tools, self.hooks, self.coordinator = context, tools, hooks, coordinator
+        from .jobs import AsyncTool, JobControl
+        eligible = set(self.config.get("background_tools", ["delegate"]))
+        for name in eligible.intersection(tools):
+            if not isinstance(tools[name], AsyncTool):
+                tools[name] = AsyncTool(tools[name])
+        tools["live_job"] = JobControl(self)
+        coordinator.register_capability("context.active_operations", lambda: [
+            {"job_id": identity, "call_id": job["call_id"], "status": job.get("status", "pending"),
+             "tool": (job.get("tool_call") or {}).get("name")}
+            for identity, job in self.jobs.items() if job.get("result") is None])
         ledger = coordinator.get_capability("live.jobs")
         if ledger:
             recovered = coordinator.get_capability("live.recovered_jobs") or []
@@ -130,13 +140,22 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 block = data.get("block", {})
                 if block.get("type") == "text" and block.get("text"):
                     await runtime.emit("assistant.message", text=block["text"])
+            elif event == "llm:stream_block_delta":
+                # Providers distinguish public text from thinking and tool JSON.
+                compacting = coordinator.get_capability("context.compacting")
+                public_stream = coordinator.get_capability("live.public_stream")
+                if (callable(compacting) and compacting()) or (callable(public_stream) and not public_stream()):
+                    return HookResult()
+                if data.get("block_type") == "text" and isinstance(data.get("text"), str):
+                    await runtime.emit("assistant.delta", text=data["text"],
+                                       request_id=data.get("request_id"), block_index=data.get("block_index"))
             elif event in {"tool:pre", "tool:post", "tool:error"}:
                 await runtime.emit("tool." + event.split(":")[1],
                     tool=data.get("tool_name"), call_id=data.get("tool_call_id"))
             return HookResult()
 
         unregister = [hooks.register(event, observe, name="live-manager-" + event)
-                      for event in ("content_block:end", "tool:pre", "tool:post", "tool:error")]
+                      for event in ("content_block:end", "llm:stream_block_delta", "tool:pre", "tool:post", "tool:error")]
 
         async def turn(command):
             activation = coordinator.get_capability("live.activation")
@@ -211,7 +230,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     if value.kind == "cancel_job":
                         job = self.jobs.get(value.target)
                         if job and not job["task"].done():
-                            job["task"].cancel()
+                            self.cancel_job(job)
                             await runtime.emit("job.cancel_requested", job_id=value.target)
                         else:
                             await runtime.emit("command.rejected", input_id=value.id, reason="no_active_job")
@@ -306,20 +325,31 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
     def _active_jobs(self):
         return any(not j["task"].done() for j in self.jobs.values())
 
+    @staticmethod
+    def cancel_job(job):
+        job["cancel_requested"] = True
+        if job.get("started"):
+            job["task"].cancel()
+
     async def _execute_tool_only(self, tool_call, tools, hooks, parallel_group_id, coordinator=None):
-        if not (self.runtime and self.config.get("background_delegate") and tool_call.name == "delegate"):
+        arguments = tool_call.arguments or {}
+        eligible = tool_call.name in self.config.get("background_tools", ["delegate"])
+        default = bool(self.config.get("background_delegate") and tool_call.name == "delegate")
+        if not (self.runtime and eligible and arguments.get("async", default) is True):
             return await super()._execute_tool_only(tool_call, tools, hooks, parallel_group_id, coordinator)
         existing = self.native_job(tool_call.id)
         if existing:
             if existing.get("tool_call") != tool_call.model_dump():
                 raise RuntimeError("Tool call identity was reused with different content")
             return tool_call.id, tool_call.name, existing.get("result", existing["receipt"])
+        if sum(not job["task"].done() for job in self.jobs.values()) >= self.config.get("max_background_jobs", 4):
+            return tool_call.id, tool_call.name, json.dumps({"success": False, "error": "Background job limit reached; wait for existing jobs before submitting more."})
         job_id = str(uuid.uuid4())
         runtime = self.runtime
         ledger = coordinator.get_capability("live.jobs") if coordinator else None
         receipt = json.dumps({"status": "queued", "job_id": job_id, "call_id": tool_call.id,
-                   "instruction": "Delegation is pending, including any approval checks. Its result will arrive "
-                   "as a later external observation. Do not repeat or poll this call. You can respond to the "
+                   "instruction": "Execution is pending, including any approval checks. Its result will arrive "
+                   "as a later external observation. Do not repeat this call. Use live_job to inspect or wait. You can respond to the "
                    "user meanwhile. Queued does not mean successful or complete."})
         if ledger:
             from .scope import NATIVE_REQUEST
@@ -336,6 +366,10 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             executor = StreamingOrchestrator(self.config)
             injections = ()
             try:
+                job = self.jobs[job_id]
+                job["started"] = True
+                if job.get("cancel_requested"):
+                    raise asyncio.CancelledError
                 _, _, result = await executor._execute_tool_only(
                     tool_call, tools, hooks, parallel_group_id, coordinator)
                 outcome, injections = "returned", executor._pending_ephemeral_injections
@@ -356,13 +390,14 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             await runtime.inbox.put(("bundle_job", (job_id, result, outcome, injections)))
 
         self.jobs[job_id] = {"task": asyncio.create_task(work()), "call_id": tool_call.id,
-                             "tool_call": tool_call.model_dump(), "receipt": receipt}
+                             "tool_call": tool_call.model_dump(), "receipt": receipt, "status": "pending"}
         self._tool_calls_this_turn += 1
-        await runtime.emit("job.queued", job_id=job_id, call_id=tool_call.id, tool="delegate")
+        await runtime.emit("job.queued", job_id=job_id, call_id=tool_call.id, tool=tool_call.name)
         return tool_call.id, tool_call.name, self.jobs[job_id]["receipt"]
 
     async def _job_returned(self, job_id, result, outcome, injections=(), *, deliver):
         job = self.jobs[job_id]
+        job["status"] = outcome
         job["result"] = serialize_result(result, outcome)
         await self.runtime.emit("job." + outcome, job_id=job_id, call_id=job["call_id"],
                                 outcome="tool_report" if outcome == "returned" else outcome,
