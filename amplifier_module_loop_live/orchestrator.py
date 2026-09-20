@@ -14,6 +14,7 @@ from collections import deque
 from amplifier_core import HookResult
 from amplifier_module_loop_streaming import StreamingOrchestrator, ConversationProviderPin
 from .runtime import Input, observation
+from .provenance import InputContext, input_metadata
 from .job_store import serialize_result
 from .host import HostAdapter, AttachmentContext
 from .scope import HOST_ADAPTER
@@ -45,7 +46,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         self.pending.clear()
         for command in commands:
             content = self.host.content(command, self.coordinator) if command.attachments else self._text(command)
-            await context.add_message({"role": "user", "content": content})
+            await context.add_message({"role": "user", "content": content, "metadata": input_metadata(command)})
             await self.runtime.emit("input.delivered", input_id=command.id,
                                     delivery="request_boundary", source=command.source)
         for text in legacy:
@@ -153,6 +154,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 turn_context = context
                 if command.attachments:
                     turn_context = AttachmentContext(context, self._text(command), self.host.content(command, coordinator))
+                turn_context = InputContext(turn_context, self._text(command), command)
                 result = await super(BundleLiveOrchestrator, self).execute(
                     self._text(command), turn_context, providers, tools, hooks, coordinator)
                 await runtime.inbox.put(("bundle_turn", (result, None)))
