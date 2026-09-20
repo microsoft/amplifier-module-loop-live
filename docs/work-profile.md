@@ -25,12 +25,13 @@ includes:
 The root includes five tools, including `delegate` and `read_transcript`. The
 behavior alone changes only the loop/context and adds transcript retrieval; it
 preserves the existing tools and provider configuration. Module sources use
-reviewed commit IDs, including merged loop-live `7a2a9b9` and context-managed
+reviewed commit IDs, including merged loop-live `11a730a` and context-managed
 `5b0816e`. A host source override can still supersede a source: inspect Unified's
 effective configuration when comparing results.
 
 Unified v0.11.1 supplies the tested HTTP/SSE host contract; the adapter now pins
-v0.11.2 with the fresh-browser startup fix. Unified supplies passive
+v0.11.4 with the fresh-browser and empty-composer fixes. The profile also pins
+the merged loop-live scheduling fix required by the real browser checks. Unified supplies passive
 conversation history and child model inheritance. These are host capabilities,
 not new tools installed into arbitrary hosts by this bundle. Plain finite hosts
 still run finite turns; installing YAML alone does not create a concurrent UI.
@@ -93,15 +94,37 @@ usage/cost. `events.json` contains public events, never raw reasoning. Canonical
 transcripts stay in the isolated shared root. Missing price information must remain
 unknown, not zero. Preserve failed runs alongside successful ones.
 
-## Finish the audio and browser acceptance
+## Reproduce browser and synthetic-audio acceptance
 
-In an isolated Unified instance with the profile selected, use two authenticated
-browser windows and the same synthetic workspace. Start a slow delegated task,
-connect Live voice, ask a side question, correct the task, interrupt spoken output,
-then end the call. Verify typed input remains available, progress is readable,
-accepted work finishes once, and the final result appears in both windows. Repeat
-through reconnect and visible compaction. Record the browser, voice model,
-timestamps and observed failures separately from the automated API evidence.
+```sh
+uv sync --project adapters/unified --locked --group browser
+uv run --project adapters/unified --locked --group browser python -m playwright install chromium
+uv run --project adapters/unified --locked --group browser python adapters/unified/browser_acceptance.py \
+  --allow-live --provider <configured-instance-id> \
+  --output /absolute/private/new-browser-run
+```
+
+Use `--scenario compaction` for visible compaction and a correction during the
+pause. The default interaction uses two real browser clients, independent drafts,
+a real pending child, visible public streaming, an offline browser during task
+completion, reconnection, and reload. Screenshots are saved for visual review.
+Authentication uses the isolated host's control token scoped to its local origin;
+this does not exercise PAM login. The app's security policy remains enabled.
+
+On macOS, add `--voice-audio` to feed explicitly synthetic speech through Chromium's
+microphone into the app's real voice connection. This uses `say` and `afconvert`,
+requires a configured voice credential, and makes additional paid voice calls.
+It checks recognized speech reaching the working session, outbound/inbound audio
+packets and received audio energy, and accepted work surviving call end. It never
+records the physical microphone. The default `--voice-phrasing direct` uses the
+same correction as the text test. `--voice-phrasing forwarded` retains a naturally
+phrased forwarding request that exposed a correction-handling failure; see the
+validation report. Neither variant proves physical speaker output or spoken
+barge-in. Do not compare its elapsed time with text latency: the microphone file
+intentionally begins with 30 seconds of silence for connection establishment.
+
+Physical microphone/speaker use, interruption of spoken output, and additional
+browser/device combinations still require separate acceptance.
 
 The profile does not yet add durable compaction checkpoints, portable child-agent
 coordination, a shared asynchronous-question ledger, or managed process I/O.

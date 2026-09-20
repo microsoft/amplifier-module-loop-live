@@ -2,20 +2,24 @@
 
 The pinned profile is installable and the portable interaction works with real
 OpenAI and Anthropic providers in Unified. This establishes the tested execution
-contracts. It does not establish ChatGPT quality parity, broad reliability, or
-microphone/browser acceptance.
+contracts. Real Chromium interaction and compaction now pass as well. This does
+not establish ChatGPT quality parity, broad reliability, or physical microphone
+and speaker acceptance. A voice intent failure is retained below.
 
 ## Tested setup
 
 - Unified v0.11.1, merged `6e9db3e07516af13c352292fed7843eed363cff2`.
   Initial interaction runs used candidate `9ba0ca5`; the merge changes only a
   validation document relative to that candidate, not application code.
-- The final adapter lock targets released v0.11.2,
+- The preceding adapter lock targeted released v0.11.2,
   `93e5d5d48ecb61401b84d248ffa9a64fc5f8fee9`, which fixes fresh-browser startup.
   Its 49 offline tests and a fresh real-provider Terra compaction run passed all
   14 checks, including public streaming, successful summarization, private summary
   text, input retention and HTTP/SSE reconnect. Compaction took 6.769 s in that run.
-- Core 1.6.1; Foundation `695f875`; loop-live `7a2a9b9`;
+- The current adapter pins Unified v0.11.4 `9112dc3` and merged loop-live
+  `11a730a`. Browser runs used fix commit `171414e`, whose loop/test changes are
+  identical to the separately merged scheduling correction (PR #5).
+- Core 1.6.1; Foundation `695f875`; initial API matrix loop-live `7a2a9b9`;
   loop-streaming `603aa6e`; context-simple `2bc8b15`;
   context-managed/tool-transcript `5b0816e`.
 - Python 3.13 on macOS. A fresh installation using the committed adapter manifest
@@ -46,7 +50,8 @@ side answer arrived in 3.844 s while the child remained gated. Fresh text stream
 was visible in eight SSE snapshots. This is transport evidence, not a visual
 review of the browser or a voice-audio latency measurement.
 
-Offline validation: **49 tests passed** in the isolated and locked environments.
+Offline validation: **50 tests passed** after the scheduling regression was added
+(49 in the preceding isolated and locked environments).
 The new tests exercise real Foundation composition from an unrelated workspace,
 preservation of existing providers/tools, and a comparison that changes only
 context policy. Source distribution and wheel both built. Ordinary CI never
@@ -92,10 +97,57 @@ after restart. Adding more modules should follow observed failures in that corpu
 Private raw reports, canonical transcripts and failure evidence remain outside
 Git. Only this sanitized summary is included here.
 
+## Browser and audio continuation
+
+Two real Chromium clients on the same isolated host exercised real Terra responses.
+The text interaction passed all 11 checks: a side answer in 2.769 s while the child
+was gated; corrected final result; actual stdout verified; one command execution;
+completion while browser A was offline; final response visible in both clients;
+separate drafts; live public text in both windows; reload preservation; and no
+browser, HTTP or visible UI errors. Screenshots were visually inspected.
+
+The browser compaction scenario passed all 9 checks. Its visible “Making room”
+status remained compatible with entering a correction, and the report objective,
+reference and corrected color survived. Both clients showed public streaming,
+and the second client's draft remained unchanged.
+
+The browser uncovered a real ownership scheduling race: after removing a pending
+input, loop-live scheduled a turn before marking its generation active. A host
+control could briefly see an idle session and release the turn's activation. The
+fix publishes generation start before scheduling the task. A deterministic test
+fails against the previous code and passes the fix; stale activation guards remain
+in place. This was newly exposed by browser coverage, not introduced by v0.11.4.
+The focused correction was separately reviewed and merged in loop-live PR #5.
+
+Real `gpt-live-1` audio connected with a synthetic Chromium microphone. Speech was
+recognized and forwarded to the same Terra session, which answered while its
+child was pending. The complete forwarded-phrasing run passed 14 of 15 checks:
+audio packets traveled in both directions, received audio energy was nonzero,
+ending the call left accepted work running, the child executed once, and both
+browsers received its result after reconnect. **Correction retention failed:**
+“tell Amplifier ... delegate this update” was interpreted as a request for another
+child, and the original BLUE color remained. The canonical request contains the
+recognized correction. This is an intent-handling failure, not a successful voice
+acceptance or a transport error. It remains reproducible with
+`--voice-phrasing forwarded`.
+
+A separate run using the direct correction from the text scenario passed all 15
+checks, including ORANGE retention and call end without canceling accepted work.
+It recorded 2,388 outbound and 2,315 inbound audio packets with nonzero received
+audio energy. Its 42.847 s interval starts at the call click and includes the
+fixture's 30 seconds of initial silence, so it is not a speech-response latency
+measurement. The successful direct request does not erase the forwarded-request
+failure or establish general voice instruction reliability.
+
+Test-helper failures are also retained separately: string polling conflicted with
+the app's CSP; a Markdown `42.` list marker was invisible to a text-only locator;
+and an absent RTP statistic was represented as null. The helper fixes preserve
+CSP and recognize actual rendered output; none changes the app's results.
+
 ## Still unverified
 
-Microphone input, speech recognition, WebRTC, playback, spoken interruption,
-visual browser acceptance, broad model task quality, durable compaction resume,
-and crash recovery of all pending external operations. The voice backend test
-does not substitute for those audio checks. The documented manual procedure in
-[work-profile.md](work-profile.md) covers the remaining user-facing acceptance.
+Physical microphone and speaker behavior, spoken interruption, other browser/device
+combinations, broad model task quality, durable compaction resume, and crash
+recovery of all pending external operations. Synthetic audio transport and visual
+browser checks do not prove those properties. See
+[work-profile.md](work-profile.md) for reproduction and remaining acceptance.
