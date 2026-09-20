@@ -10,6 +10,7 @@ import asyncio
 import json
 import uuid
 from collections import deque
+from contextvars import ContextVar
 
 from amplifier_core import HookResult
 from amplifier_module_loop_streaming import StreamingOrchestrator, ConversationProviderPin
@@ -20,6 +21,7 @@ from .host import HostAdapter, AttachmentContext
 from .scope import HOST_ADAPTER
 
 _WAKE = "[loop-live inbox wake]"
+_GOAL_SCOPE = ContextVar("live_goal_scope", default=None)
 
 
 class BundleLiveOrchestrator(StreamingOrchestrator):
@@ -31,6 +33,31 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         self.load_failures = []
         self.running = False
         self.root_provider = None
+
+    async def _execute_guarded_goal(self, prompt, context, providers, tools, hooks, coordinator):
+        # An explicit input always receives its first turn. Only automatic goal
+        # continuations consult the host at the last safe admission boundary.
+        token = _GOAL_SCOPE.set({"coordinator": coordinator, "turns": 0, "result": ""})
+        try:
+            return await super().execute(prompt, context, providers, tools, hooks, coordinator)
+        finally:
+            _GOAL_SCOPE.reset(token)
+
+    async def _execute_one_turn(self, *args, **kwargs):
+        scope = _GOAL_SCOPE.get()
+        if scope is not None:
+            coordinator = scope["coordinator"]
+            guard = coordinator.get_capability("live.continuation_guard") if coordinator else None
+            if scope["turns"] and guard and not await guard():
+                # A pause can arrive while the base engine awaits its evaluator,
+                # after it captured an older goal. Do not admit that stale turn.
+                coordinator.session_state["goal"] = None
+                return scope["result"]
+            scope["turns"] += 1
+        result = await super()._execute_one_turn(*args, **kwargs)
+        if scope is not None:
+            scope["result"] = result
+        return result
 
     def _select_provider(self, providers):
         return self.root_provider or super()._select_provider(providers)
@@ -96,7 +123,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         if runtime is None:
             # CLI's production spawner expects a finite result from workers.
             try:
-                result=await super().execute(prompt, context, providers, tools, hooks, coordinator)
+                result=await self._execute_guarded_goal(prompt, context, providers, tools, hooks, coordinator)
                 self.host.finite_finished(finite_scope, coordinator, "completed", result)
                 return result
             except BaseException as exc:
@@ -172,7 +199,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 if command.attachments:
                     turn_context = AttachmentContext(context, self._text(command), self.host.content(command, coordinator))
                 turn_context = InputContext(turn_context, self._text(command), command)
-                result = await super(BundleLiveOrchestrator, self).execute(
+                result = await self._execute_guarded_goal(
                     self._text(command), turn_context, providers, tools, hooks, coordinator)
                 await runtime.inbox.put(("bundle_turn", (result, None)))
             except asyncio.CancelledError:
@@ -420,6 +447,7 @@ async def mount(coordinator, config=None):
     loop = BundleLiveOrchestrator(config)
     await coordinator.mount("orchestrator", loop)
     coordinator.register_capability("session.steer", loop.steer)
+    coordinator.register_capability("live.continuation_guard_supported", True)
     coordinator.register_capability("conversation.provider_pin", ConversationProviderPin(loop, coordinator))
     async def failed(event, data):
         loop.load_failures.append({"module": data.get("module_id"), "type": data.get("module_type")})

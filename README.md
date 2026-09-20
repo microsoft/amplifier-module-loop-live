@@ -89,3 +89,13 @@ optional adapter and application integration are tested separately by Amplifier
 Converge's runtime suite. The job ledger currently requires macOS or Linux.
 
 See [provenance](PROVENANCE.md) for the extraction boundary and upstream dependencies.
+
+### Host continuation admission
+
+The mounted loop advertises `live.continuation_guard_supported: true`. A host may
+register async `live.continuation_guard() -> bool`. The loop calls it immediately
+before each automatic goal continuation, including after an awaited goal
+evaluator. False clears the goal and returns the last response without submitting
+a new model request. Exceptions fail closed. The initial turn for an explicit
+input always runs; this guard does not cancel current work, replay input, grant
+permissions, or create a second scheduler. Hosts own durable pause/resume state.
