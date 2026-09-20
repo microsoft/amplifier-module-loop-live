@@ -9,7 +9,7 @@ terminal handling, and existing provider extensions are packaged separately
 under `adapters/cli`. The browser, gateway, detached application host, demo loop,
 and tool-disabled voice consultation remain in Amplifier Converge.
 
-The core still subclasses the pinned upstream `StreamingOrchestrator`; this is
+The core still subclasses the upstream `StreamingOrchestrator`; this is
 an explicit compatibility dependency, not a claim of a stable upstream extension
 API. The CLI adapter retains the existing OpenAI transport and local computer-use
 compatibility repairs. Those are host-specific experimental extensions; the core
