@@ -183,7 +183,7 @@ the user. Core plus Foundation/adapter composition passed 50 tests; source and
 wheel packages built. These are correctness and integration checks, not a model
 quality benchmark.
 
-The adapter now supersedes that preview pin with `b8eaa37` on v0.11.9. It includes
+The retention update superseded that preview pin with `b8eaa37` on v0.11.9. It includes
 the reviewed `10a1bd5` canvas-retention hotfix (merged in Unified PR #75). The
 voice, provider-selection, history-projection and worker source files are
 unchanged from the candidate used for the three paid browser scenarios above.
@@ -196,8 +196,24 @@ should not be used for durable canvas work.
 The running upgraded preview retained a synthetic canvas body through 75 seconds
 of normal client actions (crossing the maintenance interval), then through a
 second restart. Two independent client drafts also survived. Reopening the
-artifact succeeded through the API. Visual reopening is being checked separately.
+artifact succeeded through the API. The first visual reopening check revealed a
+separate existing bug: saved ordinary content remained behind a resource reference
+while the Markdown viewer expected inline text. Content was intact but not shown.
 Existing user transcripts and client draft/attachment records remained unchanged.
+
+The final adapter pin is `e0c5b54`, which also incorporates the focused compatibility
+fix `2a2f250`. The actual preview now renders that same retained Markdown artifact
+after restart. The exact marker was verified in Chromium and the screenshot was
+visually inspected. Its two-client drafts and transcript hashes stayed intact.
+The dedicated real-host restart browser test also passed, including Source
+controls, unchanged artifact/session identities and the unsent draft. No frontend
+production code or worker behavior changed in this compatibility fix.
+The final combined Python suite passed 1,053 tests with 11 opt-in skips; the
+source and wheel packages built and the candidate's CI checks passed.
+
+A fresh real-provider conversation in the updated preview called the host's
+history `search` and `read` operations, recovered the earlier synthetic reference,
+and kept the current conversation selected. It did not rerun the earlier task.
 
 ## Still unverified
 

@@ -201,7 +201,7 @@ source = { git = "https://github.com/microsoft/amplifier-bundle-context-managed?
 [[package]]
 name = "amplifier-unified"
 version = "0.11.9"
-source = { git = "https://github.com/bkrabach/amplifier-unified?rev=b8eaa37f3d07a1994025be73bb5336b7937fba03#b8eaa37f3d07a1994025be73bb5336b7937fba03" }
+source = { git = "https://github.com/bkrabach/amplifier-unified?rev=e0c5b5452b0379b275f1d623a1ffad57b82bdfdc#e0c5b5452b0379b275f1d623a1ffad57b82bdfdc" }
 dependencies = [
     { name = "aiohttp" },
     { name = "amplifier-bundle-context-intelligence", extra = ["client"] },
@@ -251,7 +251,7 @@ requires-dist = [
     { name = "amplifier-module-provider-anthropic", git = "https://github.com/microsoft/amplifier-module-provider-anthropic?rev=12fffb6ad2bafb1bb7999ab02245a35e42ca8672" },
     { name = "amplifier-module-provider-openai", git = "https://github.com/microsoft/amplifier-module-provider-openai?rev=c9b0e8e60702269c7a637875b89d011facfde020" },
     { name = "amplifier-module-tool-transcript", git = "https://github.com/microsoft/amplifier-bundle-context-managed?subdirectory=modules%2Ftool-transcript&rev=5b0816edb8761dc0ad38719ae59b4ee40808b36a" },
-    { name = "amplifier-unified", git = "https://github.com/bkrabach/amplifier-unified?rev=b8eaa37f3d07a1994025be73bb5336b7937fba03" },
+    { name = "amplifier-unified", git = "https://github.com/bkrabach/amplifier-unified?rev=e0c5b5452b0379b275f1d623a1ffad57b82bdfdc" },
 ]
 
 [package.metadata.requires-dev]
