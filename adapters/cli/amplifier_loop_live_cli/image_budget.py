@@ -53,7 +53,11 @@ def png_budget_view(params):
 
 
 class ImageBudgetMixin:
-    def _estimated_input_tokens(self, params):
+    def _estimated_input_tokens(self, params, *, serialized_bytes=None):
+        # Current providers own typed-media budgeting and supply measured bytes.
+        # Preserve their decision; retain the PNG fallback for older drivers.
+        if serialized_bytes is not None:
+            return super()._estimated_input_tokens(params, serialized_bytes=serialized_bytes)
         adjusted = png_budget_view(params)
         if adjusted is None:
             return super()._estimated_input_tokens(params)
