@@ -19,12 +19,19 @@ jobs:
           python-version: ${{ matrix.python }}
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --group dev
+      - name: Resolve current Amplifier sources
+        run: |
+          uv pip install --python .venv/bin/python --upgrade \
+            'amplifier-core @ git+https://github.com/microsoft/amplifier-core@main' \
+            'amplifier-module-loop-streaming @ git+https://github.com/microsoft/amplifier-module-loop-streaming@main' \
+            'amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@main'
       - run: uv run --no-sync pytest -q
       - run: uv build
       - name: Check installed wheel without application adapters
         run: |
           uv venv "$RUNNER_TEMP/loop-live-smoke"
-          uv pip install --python "$RUNNER_TEMP/loop-live-smoke/bin/python" dist/*.whl amplifier-core==1.6.1
+          uv pip install --python "$RUNNER_TEMP/loop-live-smoke/bin/python" dist/*.whl \
+            'amplifier-core @ git+https://github.com/microsoft/amplifier-core@main'
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/loop-live-smoke/bin/python" -I -c 'from amplifier_module_loop_live import mount; from amplifier_module_loop_live.runtime import Runtime, Input; import sys; assert not any(name.startswith(("amplifier_app_cli", "amplifier_loop_live_cli", "amplifier_live", "amplifier_web")) for name in sys.modules)'
   native-adapter:
@@ -36,8 +43,13 @@ jobs:
           python-version: '3.13'
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --group dev
-      - name: Install the current optional provider
-        run: uv pip install --python .venv/bin/python 'amplifier-module-provider-openai[native] @ git+https://github.com/microsoft/amplifier-module-provider-openai@main'
+      - name: Resolve current Amplifier sources and optional provider
+        run: |
+          uv pip install --python .venv/bin/python --upgrade \
+            'amplifier-core @ git+https://github.com/microsoft/amplifier-core@main' \
+            'amplifier-module-loop-streaming @ git+https://github.com/microsoft/amplifier-module-loop-streaming@main' \
+            'amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@main' \
+            'amplifier-module-provider-openai[native] @ git+https://github.com/microsoft/amplifier-module-provider-openai@main'
       - name: Require the native provider and verify adapter boundaries offline
         run: |
           uv run --no-sync python -c 'from amplifier_module_provider_openai.native import NativeResponsesProvider'
