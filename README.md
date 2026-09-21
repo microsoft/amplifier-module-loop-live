@@ -16,7 +16,7 @@ API. The optional CLI adapter has separate dependencies and packaging under
 Install into an Amplifier host environment (amplifier-core is a peer dependency):
 
 ```sh
-uv pip install 'git+https://github.com/bkrabach/amplifier-module-loop-live'
+uv pip install 'git+https://github.com/microsoft/amplifier-module-loop-live'
 ```
 
 The repository is private during development; normal GitHub authentication is
@@ -29,7 +29,7 @@ experience; Amplifier Converge supplies its own browser and session host.
 session:
   orchestrator:
     module: loop-live
-    source: git+https://github.com/bkrabach/amplifier-module-loop-live@main
+    source: git+https://github.com/microsoft/amplifier-module-loop-live@main
     config:
       background_delegate: true
 ```
