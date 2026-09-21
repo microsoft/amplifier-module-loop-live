@@ -17,7 +17,7 @@ from amplifier_module_loop_live.runtime import Runtime
 
 import amplifier_module_loop_live
 LOCAL_MODULE = Path(amplifier_module_loop_live.__file__).resolve().parent.parent
-LOOP_SOURCE = "git+https://github.com/bkrabach/amplifier-module-loop-live@main"
+LOOP_SOURCE = "git+https://github.com/microsoft/amplifier-module-loop-live@main"
 if not (LOCAL_MODULE / "pyproject.toml").is_file():
     # A wheel's site-packages directory is not an installable module source.
     # Preserve the exact Git revision when the package was installed from Git.

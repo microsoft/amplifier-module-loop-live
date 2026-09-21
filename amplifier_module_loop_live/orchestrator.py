@@ -461,7 +461,15 @@ async def mount(coordinator, config=None):
     coordinator.register_capability("tools.dispatch", loop.approved_dispatch)
     coordinator.register_capability("conversation.provider_pin", ConversationProviderPin(loop, coordinator))
     async def failed(event, data):
-        loop.load_failures.append({"module": data.get("module_id"), "type": data.get("module_type")})
+        # Older Core versions omit the category. Never forward their raw error.
+        reason = data.get("reason_code")
+        if not isinstance(reason, str) or reason not in {
+            "invalid_package_layout", "missing_source", "invalid_entry_point",
+            "invalid_module_metadata", "validation_failed", "unknown",
+        }:
+            reason = "unknown"
+        loop.load_failures.append({"module": data.get("module_id"), "type": data.get("module_type"),
+                                   "reason_code": reason})
         return HookResult()
     coordinator.hooks.register("module:load_failed", failed, name="live-mount-diagnostics")
     async def manager_instructions(event, data):
