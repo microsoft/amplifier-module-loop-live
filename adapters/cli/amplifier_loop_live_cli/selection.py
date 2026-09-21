@@ -92,7 +92,8 @@ async def select_root(session, plan, selection=None):
         if row["provider"] == "openai" and model.id == "gpt-6-astra" and not getattr(provider, "native_bundle_live", False):
             from amplifier_loop_live_cli.bundle_astra import BundleAstraProvider
             provider = BundleAstraProvider.wrap(provider)
-            session.coordinator.register_cleanup(provider.close_live)
+            cleanup = provider.close_live if getattr(provider, "native_bundle_live", False) else provider.close
+            session.coordinator.register_cleanup(cleanup)
         selection = {"instance": row["id"], "provider": row["provider"], "model": model.id,
                      "effort": effort, "thinkingBudget": budget}
         loop.root_provider = RootProvider(provider, selection, row["provider"], session.coordinator.get_capability("live.runtime"))
