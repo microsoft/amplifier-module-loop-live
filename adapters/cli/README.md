@@ -9,29 +9,36 @@ The adapter currently requires Python 3.13 and includes the configured provider
 extensions used by the prototype. This dependency set is intentionally separate
 from the core package.
 
-## Install the customized CLI
+## Install the CLI and live adapter
 
-Use an isolated tool installation when evaluating alongside an existing CLI:
+Use an isolated tool installation when evaluating alongside an existing CLI.
+Repeating this command refreshes its sources and upgrades this isolated install:
 
 ```sh
-# Match the reviewed foundation revision across the CLI and adapter metadata.
+# Keep Foundation's current source consistent across the CLI and adapter.
 cat > loop-live-overrides.txt <<'PINS'
 amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main
 PINS
 
 UV_TOOL_DIR="$PWD/.tools" UV_TOOL_BIN_DIR="$PWD/.bin" uv tool install \
-  --python 3.13 --overrides loop-live-overrides.txt \
+  --python 3.13 --force --upgrade --refresh --overrides loop-live-overrides.txt \
   --with 'amplifier-module-loop-live @ git+https://github.com/microsoft/amplifier-module-loop-live@main' \
-  --with 'amplifier-core>=1.6.1' \
+  --with 'amplifier-core @ git+https://github.com/microsoft/amplifier-core@main' \
   --with 'amplifier-loop-live-cli @ git+https://github.com/microsoft/amplifier-module-loop-live@main#subdirectory=adapters/cli' \
-  'git+https://github.com/bkrabach/amplifier-app-cli@loop-live'
+  --with-executables-from amplifier-loop-live-cli \
+  'amplifier-app-cli @ git+https://github.com/microsoft/amplifier-app-cli@main'
 
-.bin/amplifier live --workspace /path/to/project --inspect
-.bin/amplifier live --workspace /path/to/project
+.bin/amplifier-live-manager --workspace /path/to/project --inspect
+.bin/amplifier-live-manager --workspace /path/to/project
 ```
 
-Both repositories are private during development. Normal GitHub authentication
-must be available. Pin exact revisions when retaining a validation environment.
+The CLI's ordinary `amplifier` commands and the adapter's
+`amplifier-live-manager` entry point share this isolated environment. Canonical
+CLI main does not provide the experimental `amplifier live` command. The adapter
+entry point invokes the same live manager directly.
+
+Normal GitHub authentication must be available. Keep install sources at `main`
+and record their resolved revisions when retaining validation evidence.
 
 `--inspect` prepares the configured environment and writes redacted reports
 without making a model turn. `--pin-provider` selects a configured root provider
