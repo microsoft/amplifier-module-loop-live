@@ -34,9 +34,12 @@ session:
       background_delegate: true
 ```
 
-Pin a reviewed revision in an application lockfile. The optional behavior in
-`behaviors/live.yaml` can be composed with a bundle that supplies context,
-providers, tools, and hooks. YAML selects the loop; the application supplies its
+Keep the module source on `main`; consuming hosts stage and validate updates and
+record installed revisions for rollback. Put this configuration in the host's
+root bundle or standalone execution composition, alongside its context module.
+Reusable behaviors leave orchestrator selection to that host. The former
+`behaviors/live.yaml` selector has been removed; consumers of that path should
+use the configuration above. YAML selects the loop; the application supplies its
 live runtime. An ordinary host without that runtime keeps finite execution.
 
 ## Host contract
