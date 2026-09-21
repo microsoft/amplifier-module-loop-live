@@ -77,3 +77,16 @@ merge. An already wrapped driver retains ordinary transport rather than bypassin
 its instance-level wrapper. A queued correction is reported applied only after
 its successor response. Accepted-then-failed steering stops for explicit recovery
 instead of inserting the same canonical input twice.
+
+The ordinary fallback also covers explicit model selection and registers the
+driver's ordinary cleanup. Existing instance-level completion wrappers remain
+intact. To preserve an installation's current native steering capability, merge
+the companion provider implementation before this adapter; the older-provider
+fallback intentionally provides ordinary transport, not native steering.
+
+At the actual native request boundary, the CLI bridges the provider-owned request
+identity into the loop's existing job-ledger scope. This preserves the original
+native call item when saved jobs are recovered. The bridge requires the current
+provider's own active scope, clears inherited attribution for ordinary/utility
+calls, and restores surrounding contexts on completion or cancellation. The core
+loop does not import the provider or CLI to obtain that identity.

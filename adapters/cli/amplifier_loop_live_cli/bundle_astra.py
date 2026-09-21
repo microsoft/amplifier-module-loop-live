@@ -1,5 +1,5 @@
 """CLI image policy and ownership binding for provider-owned native transport."""
-from amplifier_module_loop_live.scope import LIVE_OWNER
+from amplifier_module_loop_live.scope import LIVE_OWNER, NATIVE_REQUEST as LOOP_NATIVE_REQUEST
 from amplifier_module_provider_openai import OpenAIProvider
 try:
     from amplifier_module_provider_openai.native import NativeResponsesProvider, NATIVE_REQUEST
@@ -26,6 +26,7 @@ class SafeOpenAIProvider(ImageBudgetMixin, OpenAIProvider):
 
     async def complete(self, request, **kwargs):
         from amplifier_loop_live_cli.computer_results import ComputerResultError
+        token = LOOP_NATIVE_REQUEST.set(None)
         try:
             return await super().complete(request,**kwargs)
         except ComputerResultError as exc:
@@ -33,12 +34,14 @@ class SafeOpenAIProvider(ImageBudgetMixin, OpenAIProvider):
             if owner:
                 await owner.runtime.emit("provider.error",error_type="computer_capture_failed",public_message=exc.public_message)
             raise
+        finally:
+            LOOP_NATIVE_REQUEST.reset(token)
 
 
 class BundleAstraProvider(ImageBudgetMixin, NativeResponsesProvider):
     @classmethod
     def wrap(cls, original):
-        if not NATIVE_AVAILABLE:
+        if not NATIVE_AVAILABLE or "complete" in original.__dict__:
             return SafeOpenAIProvider.wrap(original)
         from .diagnostics import trace, trace_native_context
         return super().wrap(original, owner_getter=LIVE_OWNER.get, trace=trace,
@@ -52,8 +55,21 @@ class BundleAstraProvider(ImageBudgetMixin, NativeResponsesProvider):
         from .computer_results import validate_computer_outputs
         return validate_computer_outputs(items)
 
+    async def _native_response(self, params):
+        # The provider owns native eligibility and its own request context.
+        # Bind the loop's existing attribution only at the actual native wire
+        # boundary, so its durable job ledger can retain original async calls.
+        token = LOOP_NATIVE_REQUEST.set(self if NATIVE_REQUEST.get() is self else None)
+        try:
+            return await super()._native_response(params)
+        finally:
+            LOOP_NATIVE_REQUEST.reset(token)
+
     async def complete(self, request, **kwargs):
         from .computer_results import ComputerResultError
+        # A nested utility/ordinary call must not inherit its caller's native
+        # job attribution. The native boundary below opts back in only when used.
+        token = LOOP_NATIVE_REQUEST.set(None)
         try:
             return await super().complete(request, **kwargs)
         except ComputerResultError as exc:
@@ -62,6 +78,8 @@ class BundleAstraProvider(ImageBudgetMixin, NativeResponsesProvider):
                 await owner.runtime.emit("provider.error", error_type="computer_capture_failed",
                                          public_message=exc.public_message)
             raise
+        finally:
+            LOOP_NATIVE_REQUEST.reset(token)
 
 
 async def install(coordinator, native=True):
