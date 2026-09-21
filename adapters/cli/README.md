@@ -11,7 +11,8 @@ from the core package.
 
 ## Install the CLI and live adapter
 
-Use an isolated tool installation when evaluating alongside an existing CLI:
+Use an isolated tool installation when evaluating alongside an existing CLI.
+Repeating this command refreshes its sources and upgrades this isolated install:
 
 ```sh
 # Keep Foundation's current source consistent across the CLI and adapter.
@@ -20,7 +21,7 @@ amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@mai
 PINS
 
 UV_TOOL_DIR="$PWD/.tools" UV_TOOL_BIN_DIR="$PWD/.bin" uv tool install \
-  --python 3.13 --overrides loop-live-overrides.txt \
+  --python 3.13 --force --upgrade --refresh --overrides loop-live-overrides.txt \
   --with 'amplifier-module-loop-live @ git+https://github.com/microsoft/amplifier-module-loop-live@main' \
   --with 'amplifier-core @ git+https://github.com/microsoft/amplifier-core@main' \
   --with 'amplifier-loop-live-cli @ git+https://github.com/microsoft/amplifier-module-loop-live@main#subdirectory=adapters/cli' \
