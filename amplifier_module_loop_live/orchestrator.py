@@ -20,6 +20,7 @@ from .job_store import serialize_result
 from .host import HostAdapter, AttachmentContext
 from .scope import HOST_ADAPTER
 from .dispatch import ApprovedDispatch
+from .failures import ManagerTurnError, turn_failure
 
 _WAKE = "[loop-live inbox wake]"
 _GOAL_SCOPE = ContextVar("live_goal_scope", default=None)
@@ -192,6 +193,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             activation = coordinator.get_capability("live.activation")
             activation_token = None
             owner_token = LIVE_OWNER.set(self)
+            stage = "turn_setup"
             try:
                 if activation:
                     activation_token = activation.bind(command.activation)
@@ -202,13 +204,14 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 if command.attachments:
                     turn_context = AttachmentContext(context, self._text(command), self.host.content(command, coordinator))
                 turn_context = InputContext(turn_context, self._text(command), command)
+                stage = "manager_turn"
                 result = await self._execute_guarded_goal(
                     self._text(command), turn_context, providers, tools, hooks, coordinator)
                 await runtime.inbox.put(("bundle_turn", (result, None)))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await runtime.inbox.put(("bundle_turn", (None, type(exc).__name__)))
+                await runtime.inbox.put(("bundle_turn", (None, (exc, turn_failure(exc, stage)))))
             finally:
                 if activation and activation_token is not None:
                     activation.reset(activation_token)
@@ -286,9 +289,11 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     active = None
                     result, error = value
                     if error:
-                        await runtime.emit("generation.failed", error_type=error)
-                        await runtime.emit("provider.error", error_type=error)
-                        raise RuntimeError("Manager turn failed; no automatic replay")
+                        cause, failure = error
+                        await runtime.emit("generation.failed", **failure)
+                        # The base engine owns provider-specific events. A local
+                        # context/setup failure is not evidence of provider failure.
+                        raise ManagerTurnError(failure) from cause
                     last = result or last
                     checkpoint = coordinator.get_capability("live.checkpoint")
                     if checkpoint:
