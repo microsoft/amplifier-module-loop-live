@@ -55,13 +55,13 @@ class BundleAstraProvider(ImageBudgetMixin, NativeResponsesProvider):
         from .computer_results import validate_computer_outputs
         return validate_computer_outputs(items)
 
-    async def _native_response(self, params):
+    async def _native_response(self, params, **kwargs):
         # The provider owns native eligibility and its own request context.
         # Bind the loop's existing attribution only at the actual native wire
         # boundary, so its durable job ledger can retain original async calls.
         token = LOOP_NATIVE_REQUEST.set(self if NATIVE_REQUEST.get() is self else None)
         try:
-            return await super()._native_response(params)
+            return await super()._native_response(params, **kwargs)
         finally:
             LOOP_NATIVE_REQUEST.reset(token)
 

@@ -263,3 +263,42 @@ async def test_selection_preserves_existing_instance_wrapper_and_ordinary_cleanu
     assert await loop.root_provider.provider.complete(None) == "wrapped"
     assert len(cleanups) == 1 and cleanups[0].__name__ == "close"
     await cleanups[0]()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options", [{}, {"timeout": 7.25}, {"timeout": None}])
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+async def test_native_boundary_forwards_options_and_restores_scope(monkeypatch, options, outcome):
+    from amplifier_module_provider_openai.native import NativeResponsesProvider
+
+    provider = BundleAstraProvider.wrap(
+        OpenAIProvider(api_key="fixture", config={"default_model": "gpt-6-astra"})
+    )
+    params, result, previous = {}, object(), object()
+    seen = []
+
+    async def native_response(self, received, **kwargs):
+        seen.append((self, received, kwargs, LOOP_REQUEST.get()))
+        if outcome == "error":
+            raise ValueError("fixture failure")
+        if outcome == "cancel":
+            raise asyncio.CancelledError
+        return result
+
+    monkeypatch.setattr(NativeResponsesProvider, "_native_response", native_response)
+    loop_token = LOOP_REQUEST.set(previous)
+    provider_token = PROVIDER_REQUEST.set(provider)
+    try:
+        if outcome == "success":
+            assert await provider._native_response(params, **options) is result
+        else:
+            with pytest.raises(ValueError if outcome == "error" else asyncio.CancelledError):
+                await provider._native_response(params, **options)
+        assert len(seen) == 1
+        assert seen[0][0] is provider and seen[0][1] is params
+        assert seen[0][2] == options and seen[0][3] is provider
+        assert LOOP_REQUEST.get() is previous
+        assert PROVIDER_REQUEST.get() is provider
+    finally:
+        LOOP_REQUEST.reset(loop_token)
+        PROVIDER_REQUEST.reset(provider_token)
