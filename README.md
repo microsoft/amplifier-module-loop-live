@@ -57,6 +57,23 @@ approval policy, transport authentication, persistence location, and shutdown.
 Runtime history is bounded observation, not a replay log. Saved interrupted jobs
 are evidence and are never automatically dispatched again.
 
+`JobStore.recover(transcript)` compares each saved call and result with the
+checkpoint. A returned job whose exact evidence is already present reconciles
+silently; the absence of an old display notice is not a recovery event. Missing
+calls/results and queued receipts are repaired, conflicting results fail closed,
+and newly uncertain outcomes are reported. The returned `recovered` list contains
+jobs with actual restoration/change or newly reported uncertainty, not every
+job loaded from the ledger.
+
+Recovery notices retain their stable job/call identities and service provenance.
+Their optional `metadata.recovery` object contains `version: 1`, `job_id`,
+`call_id`, `status`, `outcome`, and `reason` (`restored_evidence`,
+`changed_evidence`, or `uncertain_outcome`) for host presentation. The private
+ledger remembers which result's uncertainty was announced, so compaction that
+removes only the notice stays quiet. That fingerprint is not a checkpoint
+acknowledgment: restoring an older checkpoint or losing tool evidence still
+requires reconciliation, even if the same result was announced earlier.
+
 Live responses carry generation and delivered-input identities, separate from
 provisional assistant content and native steering acceptance. See the
 [generation event contract](docs/generation-events.md) before using completion
