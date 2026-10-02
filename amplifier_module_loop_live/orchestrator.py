@@ -65,6 +65,16 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
     def _select_provider(self, providers):
         return self.root_provider or super()._select_provider(providers)
 
+    async def _hold_anchored(self, reason):
+        retained = deque()
+        for command in self.pending:
+            if command.target_generation_id is None:
+                retained.append(command)
+            else:
+                await self.runtime.emit("steering.held", input_id=command.id,
+                    target_generation_id=command.target_generation_id, reason=reason)
+        self.pending = retained
+
     async def _drain_steering(self, context, hooks, iteration):
         if self.runtime is None:
             return await super()._drain_steering(context, hooks, iteration)
@@ -74,18 +84,28 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         legacy = [text for text in self._steering_queue.drain() if text != _WAKE]
         commands = list(self.pending)
         self.pending.clear()
+        applied = []
         for command in commands:
+            if command.target_generation_id is not None and (not self.runtime.generation or self.runtime.generation["id"] != command.target_generation_id):
+                await self.runtime.emit("steering.held", input_id=command.id,
+                    target_generation_id=command.target_generation_id, reason="generation-ended")
+                continue
             content = self.host.content(command, self.coordinator) if command.attachments else self._text(command)
             await context.add_message({"role": "user", "content": content, "metadata": input_metadata(command)})
             await self.runtime.emit("input.delivered", input_id=command.id,
-                                    delivery="request_boundary", source=command.source)
+                                    delivery="request_boundary", source=command.source,
+                                    **({"target_generation_id": command.target_generation_id} if command.target_generation_id else {}))
+            if command.target_generation_id is not None:
+                await self.runtime.emit("steering.applied", input_id=command.id,
+                    target_generation_id=command.target_generation_id, delivery="request_boundary")
+            applied.append(command)
         for text in legacy:
             await context.add_message({"role": "user", "content": text})
-        if commands or legacy:
+        if applied or legacy:
             await hooks.emit("orchestrator:steering_injected", {
                 "orchestrator": "loop-live", "iteration": iteration,
-                "input_ids": [c.id for c in commands], "queued_remaining": 0})
-        return len(commands) + len(legacy)
+                "input_ids": [c.id for c in applied], "queued_remaining": 0})
+        return len(applied) + len(legacy)
 
     def native_job(self, call_id):
         return next((job for job in self.jobs.values() if job["call_id"] == call_id), None)
@@ -159,6 +179,10 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         native = self._select_provider(providers)
         self.host.prepare_provider(native, coordinator)
         native = native if getattr(native, "native_bundle_live", False) else None
+        runtime.anchored_steering_mode = "unavailable" if native else "request_boundary"
+        coordinator.register_capability("live.steering", {"version": 1,
+            "mode": runtime.anchored_steering_mode, "cancellable": False,
+            "submit": runtime.submit_steering})
         active = None
         last = ""
         last_activation = None
@@ -229,6 +253,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             if prompt:
                 self.pending.append(Input("user", prompt))
             while True:
+                if active is None and self.pending:
+                    await self._hold_anchored("generation-ended")
                 if active is None and self.pending and runtime.inbox.empty():
                     command = self.pending.popleft()
                     # Publish busy state before scheduling: a host control can
@@ -277,6 +303,13 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                         if value.kind == "service":
                             await runtime.emit("observation.received", input_id=value.id,
                                                source=value.source, text=value.text)
+                        if value.target_generation_id is not None:
+                            if active is None or not runtime.generation or runtime.generation["id"] != value.target_generation_id:
+                                await runtime.emit("steering.held", input_id=value.id,
+                                    target_generation_id=value.target_generation_id, reason="generation-ended")
+                                continue
+                            await runtime.emit("steering.accepted", input_id=value.id,
+                                target_generation_id=value.target_generation_id, delivery="request_boundary")
                         # Multimodal updates enter through the normal Amplifier
                         # message serializer at the next request boundary.
                         if native and not value.attachments and await native.steer_live(value):
@@ -288,6 +321,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     await active
                     active = None
                     result, error = value
+                    await self._hold_anchored("generation-failed" if error else "generation-completed")
                     if error:
                         cause, failure = error
                         await runtime.emit("generation.failed", **failure)
@@ -331,6 +365,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             if active:
                 active.cancel()
                 await asyncio.gather(active, return_exceptions=True)
+            await self._hold_anchored("session-closing")
+            if active:
                 await runtime.emit("generation.detached", cancellation="unconfirmed")
             for job in self.jobs.values():
                 if not job["task"].done():
@@ -341,12 +377,21 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     await provider.close_live()
             while not runtime.inbox.empty():
                 kind, value = runtime.inbox.get_nowait()
-                if kind == "bundle_job":
+                if kind == "input":
+                    runtime.queued_inputs -= 1
+                    if value.target_generation_id is not None:
+                        await runtime.emit("steering.held", input_id=value.id,
+                            target_generation_id=value.target_generation_id, reason="session-closing")
+                elif kind == "bundle_job":
                     await self._job_returned(*value, deliver=False)
                 elif kind == "child_event":
                     await runtime.emit("child.updated", **value)
                 elif kind == "bundle_persistence_error":
                     await runtime.emit("persistence.failed", error_type=value)
+            for identity, outcome in list(runtime.steering_outcomes.items()):
+                if outcome["disposition"] == "queued":
+                    await runtime.emit("steering.unknown", input_id=identity,
+                        target_generation_id=outcome["generationId"], reason="injection-disposition-unconfirmed")
             for remove in unregister:
                 if callable(remove):
                     remove()
@@ -359,6 +404,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 except Exception as exc:
                     await runtime.emit("persistence.failed", error_type=type(exc).__name__)
             await runtime.emit("session.closed", status=status)
+            runtime.anchored_steering_mode = None
             self.running, self.runtime = False, None
         return json.dumps({"worker_status":status,"last_report":last,"effects":"not_rolled_back"}) if coordinator.get_capability("live.child") and status!="completed" else last
 

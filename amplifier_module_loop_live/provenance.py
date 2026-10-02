@@ -3,7 +3,8 @@
 def input_metadata(command):
     return {'amplifier_input': {'version': 1, 'kind': command.kind,
         'id': command.id, 'source': command.source,
-        **({'call_id': command.call_id} if command.call_id else {})}}
+        **({'call_id': command.call_id} if command.call_id else {}),
+        **({'target_generation_id': command.target_generation_id} if command.target_generation_id else {})}}
 
 
 class InputContext:

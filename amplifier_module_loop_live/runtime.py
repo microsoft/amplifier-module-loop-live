@@ -5,7 +5,7 @@ import copy
 import json
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,8 @@ class Input:
     # Host-private capability.  It is never serialized into context or exposed
     # to providers; the loop binds it only while executing this input.
     activation: object | None = field(default=None, compare=False, repr=False)
+    # Opt-in: this steering input may affect only the named generation.
+    target_generation_id: str | None = None
 
 
 class _Event(tuple):
@@ -60,6 +62,8 @@ class Runtime:
         self.closed = False
         self.max_input_chars = max_input_chars
         self.generation = None
+        self.anchored_steering_mode = None
+        self.steering_outcomes = {}
 
     async def submit(self, command: Input):
         if self.closed:
@@ -83,6 +87,13 @@ class Runtime:
             if previous != command:
                 raise ValueError("Command identity reused with different content")
             return command.id
+        if command.target_generation_id is not None:
+            if command.kind != "steer" or not isinstance(command.target_generation_id, str) or not 1 <= len(command.target_generation_id) <= 128:
+                raise ValueError("A bounded generation anchor is only valid for steering")
+            if self.anchored_steering_mode != "request_boundary":
+                raise ValueError("Anchored steering is unavailable for this execution mode")
+            if not self.generation or self.generation["id"] != command.target_generation_id:
+                raise ValueError("The anchored generation is no longer active")
         # Never silently evict identities and make an old command executable again.
         if len(self.accepted) >= 2000:
             raise RuntimeError("Session input limit reached; start a new session")
@@ -91,15 +102,30 @@ class Runtime:
         self.inbox.put_nowait(("input", command))
         self.queued_inputs += 1
         self.accepted[command.id] = command
+        if command.target_generation_id is not None:
+            self.steering_outcomes[command.id] = {"accepted": True, "inputId": command.id, "generationId": command.target_generation_id, "disposition": "queued"}
         await self.emit("input.accepted", input_id=command.id, kind=command.kind,
                         source=command.source, target=command.target)
         return command.id
+
+    async def submit_steering(self, command: Input, generation_id: str):
+        """Opt-in current-generation delivery; never starts a later turn.
+
+        Acceptance only proves queue admission. Applied/held disposition is
+        observed separately; the application owns durable command receipts.
+        """
+        if command.kind != "steer" or not isinstance(generation_id, str) or not 1 <= len(generation_id) <= 128:
+            raise ValueError("submit_steering requires a steering input and bounded generation identity")
+        if command.target_generation_id is not None and command.target_generation_id != generation_id:
+            raise ValueError("Conflicting generation anchors")
+        await self.submit(replace(command, target_generation_id=generation_id))
+        return copy.deepcopy(self.steering_outcomes[command.id])
 
     async def emit(self, event_type, **data):
         # Optional portable generation correlation. A generation is one finite
         # manager turn; it may finish while delegated jobs are still running.
         if event_type == "generation.started":
-            self.generation = {"id": data["generation_id"], "input_ids": [], "accepted_input_ids": []}
+            self.generation = {"id": data["generation_id"], "initial_input_id": data.get("initial_input_id"), "input_ids": [], "accepted_input_ids": []}
         generation = self.generation
         if generation is not None:
             if event_type in {"input.delivered", "steering.applied"}:
@@ -114,6 +140,15 @@ class Runtime:
                 data["generation_id"] = generation["id"]
                 data["input_ids"] = list(generation["input_ids"])
                 data["accepted_input_ids"] = [identity for identity in generation["accepted_input_ids"] if identity not in generation["input_ids"]]
+        identity = data.get("input_id")
+        outcome = self.steering_outcomes.get(identity)
+        if outcome is not None and data.get("target_generation_id") == outcome["generationId"]:
+            if event_type in {"input.delivered", "steering.applied"}:
+                self.steering_outcomes[identity] = {**outcome, "disposition": "applied"}
+            elif event_type == "steering.held" and outcome["disposition"] != "applied":
+                self.steering_outcomes[identity] = {**outcome, "disposition": "held", "reason": data.get("reason", "generation-ended")}
+            elif event_type == "steering.unknown" and outcome["disposition"] == "queued":
+                self.steering_outcomes[identity] = {**outcome, "disposition": "unknown", "reason": data.get("reason", "injection-unconfirmed")}
         self.sequence += 1
         event = {"version": 1, "sequence": self.sequence,
                  "session_id": self.session_id, "time": time.time(),

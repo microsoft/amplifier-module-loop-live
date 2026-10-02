@@ -48,6 +48,99 @@ class Delegate:
         return ToolResult(success=True, output={"report": "CHILD-RESULT"})
 
 class BundleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_anchored_steering_applies_only_to_its_current_generation(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        capability = self.session.coordinator.get_capability("live.steering")
+        self.assertEqual((capability["version"], capability["mode"], capability["cancellable"]), (1, "request_boundary", False))
+        result = await capability["submit"](Input("steer", "ANCHORED", id="anchored"), generation)
+        self.assertEqual(result["disposition"], "queued")
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "anchored", 3)
+        self.tool.release.set()
+        await self.provider.reply(calls=[ToolCall(id="boundary", name="delegate", arguments={"async": False})])
+        request = await self.provider.request()
+        self.assertIn("ANCHORED", str(request.messages))
+        applied = await self.runtime.wait_for(lambda e: e["type"] == "steering.applied" and e["input_id"] == "anchored", 3)
+        self.assertEqual(applied["target_generation_id"], generation)
+        duplicate = await capability["submit"](Input("steer", "ANCHORED", id="anchored"), generation)
+        self.assertEqual(duplicate["disposition"], "applied")
+        rows = await self.session.coordinator.get("context").get_messages()
+        matching = [row for row in rows if row.get("content") == "ANCHORED"]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["metadata"]["amplifier_input"]["target_generation_id"], generation)
+        await self.provider.reply("done")
+        finished = await self.runtime.wait_for(lambda e: e["type"] == "generation.finished" and e["generation_id"] == generation, 3)
+        self.assertEqual(finished["input_ids"], ["original", "anchored"])
+
+    async def test_anchored_steering_is_held_instead_of_starting_another_turn(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        command = Input("steer", "MUST NOT BECOME NEW WORK", id="held")
+        checkpoint_entered, release_checkpoint = asyncio.Event(), asyncio.Event()
+        async def checkpoint(*_args):
+            checkpoint_entered.set()
+            await release_checkpoint.wait()
+        self.session.coordinator.register_capability("live.checkpoint", checkpoint)
+        await self.provider.reply("finite final response")
+        await asyncio.wait_for(checkpoint_entered.wait(), 3)
+        await self.runtime.submit_steering(command, generation)
+        release_checkpoint.set()
+        held = await self.runtime.wait_for(lambda e: e["type"] == "steering.held" and e["input_id"] == "held", 3)
+        self.assertEqual(held["reason"], "generation-ended")
+        await self.runtime.wait_for(lambda e: e["type"] == "session.idle", 3)
+        self.assertTrue(self.provider.requests.empty())
+        self.assertNotIn(command.text, str(await self.session.coordinator.get("context").get_messages()))
+        self.assertEqual((await self.runtime.submit_steering(command, generation))["disposition"], "held")
+        with self.assertRaisesRegex(ValueError, "no longer active"):
+            await self.runtime.submit_steering(Input("steer", "STALE", id="stale"), generation)
+        self.assertNotIn("stale", self.runtime.accepted)
+        await self.runtime.submit(Input("user", "EXPLICIT NEXT INPUT", id="next"))
+        request = await self.provider.request()
+        self.assertNotIn(command.text, str(request.messages))
+        await self.provider.reply("next explicit result")
+
+    async def test_cancellation_holds_only_not_yet_injected_anchored_work(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        await self.runtime.submit_steering(Input("steer", "HELD ON CANCEL", id="held"), generation)
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "held", 3)
+        await self.runtime.submit(Input("stop", target="cancel"))
+        await asyncio.wait_for(self.task, 3)
+        self.assertEqual(self.runtime.steering_outcomes["held"]["disposition"], "held")
+        self.assertNotIn("HELD ON CANCEL", str(await self.session.coordinator.get("context").get_messages()))
+        self.assertTrue(self.provider.requests.empty())
+
+    async def test_interrupted_context_injection_is_unknown_not_false_held_evidence(self):
+        await self.start()
+        context = self.session.coordinator.get("context")
+        original = context.add_message
+        injected, release = asyncio.Event(), asyncio.Event()
+        async def add(message):
+            await original(message)
+            if message.get("metadata", {}).get("amplifier_input", {}).get("id") == "uncertain":
+                injected.set()
+                await release.wait()
+        context.add_message = add
+        await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
+        await self.provider.request()
+        await self.runtime.submit_steering(Input("steer", "PARTIAL EFFECT", id="uncertain"), self.runtime.generation["id"])
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "uncertain", 3)
+        self.tool.release.set()
+        await self.provider.reply(calls=[ToolCall(id="boundary", name="delegate", arguments={"async": False})])
+        await asyncio.wait_for(injected.wait(), 3)
+        await self.runtime.submit(Input("stop", target="cancel"))
+        await asyncio.wait_for(self.task, 3)
+        context.add_message = original
+        self.assertEqual(self.runtime.steering_outcomes["uncertain"]["disposition"], "unknown")
+        self.assertIn("PARTIAL EFFECT", str(await context.get_messages()))
+        self.assertFalse(any(e["type"] == "steering.held" and e.get("input_id") == "uncertain" for e in self.runtime.events))
+
     async def test_compaction_accepts_input_and_continues_same_task(self):
         try:
             from amplifier_module_context_managed.boundary import mount_boundary
