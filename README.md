@@ -76,7 +76,7 @@ requires reconciliation, even if the same result was announced earlier.
 
 Live responses carry generation and delivered-input identities, separate from
 provisional assistant content and native steering acceptance. See the
-[generation event contract](docs/generation-events.md) before using completion
+[generation event contract](docs/generation-events.md) and [anchored steering](docs/anchored-steering.md) before using completion
 events to resolve a host request or send a notification.
 
 Hosts sharing session storage may supply optional `live.activation` and

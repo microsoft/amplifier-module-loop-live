@@ -37,6 +37,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await runtime.submit(Input("user", "late"))
 
+    async def test_anchored_steering_refuses_unsupported_and_stale_modes_before_acceptance(self):
+        runtime = Runtime()
+        await runtime.emit("generation.started", generation_id="generation", initial_input_id="root")
+        for mode in (None, "native", "unavailable"):
+            runtime.anchored_steering_mode = mode
+            with self.assertRaisesRegex(ValueError, "unavailable"):
+                await runtime.submit_steering(Input("steer", "do not queue", id="steer"), "generation")
+        self.assertEqual(runtime.queued_inputs, 0)
+        self.assertEqual(runtime.accepted, {})
+        runtime.anchored_steering_mode = "request_boundary"
+        with self.assertRaisesRegex(ValueError, "no longer active"):
+            await runtime.submit_steering(Input("steer", "stale", id="steer"), "old-generation")
+        with self.assertRaises(ValueError):
+            await runtime.submit_steering(Input("steer", "missing generation"), None)
+        self.assertEqual(runtime.accepted, {})
+
     def test_core_has_no_host_or_provider_imports(self):
         import ast
         import amplifier_module_loop_live
