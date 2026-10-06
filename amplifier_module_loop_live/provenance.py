@@ -21,3 +21,22 @@ class InputContext:
             message = {**message, 'metadata': {**(message.get('metadata') or {}), **input_metadata(self.command)}}
             self.pending = False
         return await self.context.add_message(message)
+
+
+class ContinuationContext:
+    """Resume an accepted turn without inventing or replaying a user prompt.
+
+    The base engine always appends its initial prompt. Real pending inputs are
+    appended by the normal steering drain, with their identities, on iteration 1.
+    """
+    def __init__(self, context):
+        self.context, self.pending = context, True
+
+    def __getattr__(self, name):
+        return getattr(self.context, name)
+
+    async def add_message(self, message):
+        if self.pending and message.get('role') == 'user' and message.get('content') == '':
+            self.pending = False
+            return
+        return await self.context.add_message(message)

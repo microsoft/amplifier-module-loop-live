@@ -15,7 +15,7 @@ from contextvars import ContextVar
 from amplifier_core import HookResult
 from amplifier_module_loop_streaming import StreamingOrchestrator, ConversationProviderPin
 from .runtime import Input, observation
-from .provenance import InputContext, input_metadata
+from .provenance import InputContext, ContinuationContext, input_metadata
 from .job_store import serialize_result
 from .host import HostAdapter, AttachmentContext
 from .scope import HOST_ADAPTER
@@ -66,6 +66,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         return self.root_provider or super()._select_provider(providers)
 
     async def _hold_anchored(self, reason):
+        self.pending.extend(self.runtime.pending_steering)
+        self.runtime.pending_steering.clear()
         retained = deque()
         for command in self.pending:
             if command.target_generation_id is None:
@@ -82,6 +84,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         # The base queue is a wake signal; our queue retains identities across
         # the base engine's turn-start and cancellation queue resets.
         legacy = [text for text in self._steering_queue.drain() if text != _WAKE]
+        self.pending.extend(self.runtime.pending_steering)
+        self.runtime.pending_steering.clear()
         commands = list(self.pending)
         self.pending.clear()
         applied = []
@@ -180,6 +184,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         self.host.prepare_provider(native, coordinator)
         native = native if getattr(native, "native_bundle_live", False) else None
         runtime.anchored_steering_mode = "unavailable" if native else "request_boundary"
+        runtime.steering_wake = lambda: self.steer(_WAKE)
         coordinator.register_capability("live.steering", {"version": 1,
             "mode": runtime.anchored_steering_mode, "cancellable": False,
             "submit": runtime.submit_steering})
@@ -213,7 +218,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         unregister = [hooks.register(event, observe, name="live-manager-" + event)
                       for event in ("content_block:end", "llm:stream_block_delta", "tool:pre", "tool:post", "tool:error")]
 
-        async def turn(command):
+        async def turn(command, *, continuation=False):
             activation = coordinator.get_capability("live.activation")
             activation_token = None
             owner_token = LIVE_OWNER.set(self)
@@ -222,15 +227,18 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 if activation:
                     activation_token = activation.bind(command.activation)
                 await self._synchronize_job_results(context)
-                await runtime.emit("input.delivered", input_id=command.id,
-                                   delivery="new_turn", source=command.source)
                 turn_context = context
-                if command.attachments:
-                    turn_context = AttachmentContext(context, self._text(command), self.host.content(command, coordinator))
-                turn_context = InputContext(turn_context, self._text(command), command)
+                if continuation:
+                    turn_context = ContinuationContext(context)
+                else:
+                    await runtime.emit("input.delivered", input_id=command.id,
+                                       delivery="new_turn", source=command.source)
+                    if command.attachments:
+                        turn_context = AttachmentContext(context, self._text(command), self.host.content(command, coordinator))
+                    turn_context = InputContext(turn_context, self._text(command), command)
                 stage = "manager_turn"
                 result = await self._execute_guarded_goal(
-                    self._text(command), turn_context, providers, tools, hooks, coordinator)
+                    "" if continuation else self._text(command), turn_context, providers, tools, hooks, coordinator)
                 await runtime.inbox.put(("bundle_turn", (result, None)))
             except asyncio.CancelledError:
                 raise
@@ -319,10 +327,11 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                         await runtime.emit("input.queued", input_id=value.id, delivery="request_boundary")
                 elif kind == "bundle_turn":
                     await active
-                    active = None
                     result, error = value
-                    await self._hold_anchored("generation-failed" if error else "generation-completed")
                     if error:
+                        runtime.steering_closed = True
+                        active = None
+                        await self._hold_anchored("generation-failed")
                         cause, failure = error
                         await runtime.emit("generation.failed", **failure)
                         # The base engine owns provider-specific events. A local
@@ -332,6 +341,20 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     checkpoint = coordinator.get_capability("live.checkpoint")
                     if checkpoint:
                         await checkpoint()
+                    # Accepted input can arrive during the final response or
+                    # its checkpoint. Keep the same generation alive for it;
+                    # never replay the previous prompt or completed tools.
+                    pending = [command for command in [*self.pending, *runtime.pending_steering]
+                               if command.target_generation_id == runtime.generation['id']]
+                    if (pending and not runtime.stop_requested
+                            and not coordinator.cancellation.is_cancelled and not self._budget_exhausted):
+                        active = asyncio.create_task(turn(pending[0], continuation=True))
+                        continue
+                    # No await between the empty-queue decision and closing
+                    # admission. Later submissions fail before being accepted.
+                    runtime.steering_closed = True
+                    active = None
+                    await self._hold_anchored("generation-completed")
                     messages = await context.get_messages()
                     final_message = messages[-1] if messages else {}
                     final_content = final_message.get("content", "") if final_message.get("role") == "assistant" and not final_message.get("tool_calls") else ""
@@ -362,6 +385,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             raise
         finally:
             runtime.closed = True
+            runtime.steering_wake = None
             if active:
                 active.cancel()
                 await asyncio.gather(active, return_exceptions=True)

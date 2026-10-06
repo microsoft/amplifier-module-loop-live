@@ -5,6 +5,7 @@ import copy
 import json
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field, replace
 
 
@@ -64,6 +65,10 @@ class Runtime:
         self.generation = None
         self.anchored_steering_mode = None
         self.steering_outcomes = {}
+        self.pending_steering = deque()
+        self.steering_wake = None
+        self.steering_closed = False
+        self.stop_requested = False
 
     async def submit(self, command: Input):
         if self.closed:
@@ -94,18 +99,33 @@ class Runtime:
                 raise ValueError("Anchored steering is unavailable for this execution mode")
             if not self.generation or self.generation["id"] != command.target_generation_id:
                 raise ValueError("The anchored generation is no longer active")
+            if self.steering_closed:
+                raise ValueError("The anchored generation is finishing and no longer accepts steering")
         # Never silently evict identities and make an old command executable again.
         if len(self.accepted) >= 2000:
             raise RuntimeError("Session input limit reached; start a new session")
-        if self.queued_inputs >= 128:
+        if self.queued_inputs + len(self.pending_steering) >= 128:
             raise asyncio.QueueFull()
-        self.inbox.put_nowait(("input", command))
-        self.queued_inputs += 1
+        direct = command.target_generation_id is not None and self.steering_wake is not None
+        if direct:
+            # Admission and the request-boundary queue share one synchronous
+            # step. A busy manager inbox cannot postpone an accepted steer.
+            self.pending_steering.append(command)
+            self.steering_wake()
+        else:
+            self.inbox.put_nowait(("input", command))
+            self.queued_inputs += 1
         self.accepted[command.id] = command
+        if command.kind == "stop":
+            self.stop_requested = True
         if command.target_generation_id is not None:
             self.steering_outcomes[command.id] = {"accepted": True, "inputId": command.id, "generationId": command.target_generation_id, "disposition": "queued"}
         await self.emit("input.accepted", input_id=command.id, kind=command.kind,
                         source=command.source, target=command.target)
+        if direct:
+            await self.emit("steering.accepted", input_id=command.id,
+                            target_generation_id=command.target_generation_id, delivery="request_boundary")
+            await self.emit("input.queued", input_id=command.id, delivery="request_boundary")
         return command.id
 
     async def submit_steering(self, command: Input, generation_id: str):
@@ -125,6 +145,7 @@ class Runtime:
         # Optional portable generation correlation. A generation is one finite
         # manager turn; it may finish while delegated jobs are still running.
         if event_type == "generation.started":
+            self.steering_closed = False
             self.generation = {"id": data["generation_id"], "initial_input_id": data.get("initial_input_id"), "input_ids": [], "accepted_input_ids": []}
         generation = self.generation
         if generation is not None:

@@ -79,7 +79,8 @@ class JobControl:
                 runtime = self.loop.runtime
                 cursor = runtime.sequence
                 # Input already queued before the wait must also release it.
-                if any(command.kind in {"user", "steer"} for command in self.loop.pending) or runtime.queued_inputs:
+                if (any(command.kind in {"user", "steer"} for command in self.loop.pending)
+                        or runtime.pending_steering or runtime.queued_inputs):
                     reason = "input_pending"
                 else:
                     try:
