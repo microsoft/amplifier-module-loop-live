@@ -31,8 +31,18 @@ with `input_id`, `target_generation_id`, and `delivery: "request_boundary"`.
 a reason. Context input metadata also retains `target_generation_id`.
 Generation terminal events keep the existing distinction between delivered and
 accepted-but-undelivered input IDs. A stale or unavailable generation is rejected
-before admission. Once admitted, a finishing generation holds late input; it
-never converts that input into a fresh turn.
+before admission. Admission places anchored input directly in the boundary
+queue and wakes the engine, without waiting for the manager to consume an inbox
+event. Each boundary drains the pending batch in order.
+
+A normally finishing generation checks again after its durable checkpoint. If
+accepted steering remains, it continues the same generation with those inputs,
+without replaying the original prompt or completed tools. Otherwise it closes
+admission synchronously before terminal publication: racing submissions are
+rejected before acceptance. Stop, cancellation, failure, and exhausted call
+budgets hold pending input instead of resuming work. No input is silently moved
+to a new generation. An acknowledgment proves context insertion, not immediate
+model attention; a synchronous tool must still return before the next request.
 
 Provider-native `steer_live` is deliberately unavailable through this contract
 until it can supply a matching attribution and withdrawal/effect protocol.

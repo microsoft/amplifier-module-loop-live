@@ -14,6 +14,8 @@ The optional live runtime now publishes a bounded manager-generation contract:
 
 Finished `text` is the final ordinary assistant message from the Amplifier context, without tool calls. It excludes provisional messages that the base streaming engine may concatenate into its returned string. Empty text is valid and does not mean work completed successfully.
 
+A generation stays open through its final checkpoint while accepted request-boundary steering remains. Such input can require another engine invocation within the same generation, without another `generation.started` or replay of earlier work. Terminal publication closes admission before awaiting context reads.
+
 A finished manager generation is **not** completion of all delegated work. `active_job_ids` identifies still-running local delegate jobs. Their results reenter the manager through service observations. A host should show the manager's answer plus pending work, and continue processing later generations. Do not replay a job to obtain its result.
 
 This contract changes no finite-session behavior, imports no app/CLI/provider SDK, and adds no provider protocol fields. Existing consumers can ignore the added metadata. Fixtures cover steering during a request, provisional text before a background tool, final text selection, native acceptance versus application, correlated failure, and cancellation without a success event.

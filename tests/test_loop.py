@@ -74,34 +74,115 @@ class BundleTests(unittest.IsolatedAsyncioTestCase):
         finished = await self.runtime.wait_for(lambda e: e["type"] == "generation.finished" and e["generation_id"] == generation, 3)
         self.assertEqual(finished["input_ids"], ["original", "anchored"])
 
-    async def test_anchored_steering_is_held_instead_of_starting_another_turn(self):
+    async def test_accepted_checkpoint_steering_continues_the_same_generation(self):
         await self.start()
         await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
         await self.provider.request()
         generation = self.runtime.generation["id"]
-        command = Input("steer", "MUST NOT BECOME NEW WORK", id="held")
         checkpoint_entered, release_checkpoint = asyncio.Event(), asyncio.Event()
         async def checkpoint(*_args):
             checkpoint_entered.set()
             await release_checkpoint.wait()
         self.session.coordinator.register_capability("live.checkpoint", checkpoint)
-        await self.provider.reply("finite final response")
+        await self.provider.reply("first answer")
         await asyncio.wait_for(checkpoint_entered.wait(), 3)
-        await self.runtime.submit_steering(command, generation)
+        for i in range(3):
+            outcome = await self.runtime.submit_steering(Input("steer", f"LATE-{i}", id=f"late-{i}"), generation)
+            self.assertEqual(outcome["disposition"], "queued")
         release_checkpoint.set()
-        held = await self.runtime.wait_for(lambda e: e["type"] == "steering.held" and e["input_id"] == "held", 3)
-        self.assertEqual(held["reason"], "generation-ended")
-        await self.runtime.wait_for(lambda e: e["type"] == "session.idle", 3)
-        self.assertTrue(self.provider.requests.empty())
-        self.assertNotIn(command.text, str(await self.session.coordinator.get("context").get_messages()))
-        self.assertEqual((await self.runtime.submit_steering(command, generation))["disposition"], "held")
+        request = await self.provider.request()
+        text = str(request.messages)
+        self.assertEqual(text.count("ORIGINAL"), 1)
+        positions = [text.index(f"LATE-{i}") for i in range(3)]
+        self.assertEqual(positions, sorted(positions))
+        self.assertTrue(all(text.count(f"LATE-{i}") == 1 for i in range(3)))
+        self.assertEqual(self.runtime.generation["id"], generation)
+        self.assertFalse(any(e["type"] == "generation.finished" for e in self.runtime.events))
+        await self.provider.reply("all questions answered")
+        finished = await self.runtime.wait_for(lambda e: e["type"] == "generation.finished", 3)
+        self.assertEqual(finished["input_ids"], ["original", "late-0", "late-1", "late-2"])
+        self.assertEqual(len([e for e in self.runtime.events if e["type"] == "generation.started"]), 1)
+        self.assertEqual((await self.runtime.submit_steering(Input("steer", "LATE-1", id="late-1"), generation))["disposition"], "applied")
         with self.assertRaisesRegex(ValueError, "no longer active"):
             await self.runtime.submit_steering(Input("steer", "STALE", id="stale"), generation)
-        self.assertNotIn("stale", self.runtime.accepted)
-        await self.runtime.submit(Input("user", "EXPLICIT NEXT INPUT", id="next"))
+        rows = await self.session.coordinator.get("context").get_messages()
+        self.assertFalse(any(m.get("role") == "user" and m.get("content") == "" for m in rows))
+
+    async def test_burst_during_model_and_tools_reaches_next_request_once(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        await self.runtime.submit_steering(Input("steer", "MODEL-UPDATE", id="model"), generation)
+        await self.provider.reply(calls=[ToolCall(id="step", name="delegate", arguments={"async": False})])
+        await self.runtime.wait_for(lambda e: e["type"] == "tool.pre", 3)
+        for i in range(3):
+            await self.runtime.submit_steering(Input("steer", f"TOOL-UPDATE-{i}", id=f"tool-{i}"), generation)
+        self.tool.release.set()
         request = await self.provider.request()
-        self.assertNotIn(command.text, str(request.messages))
-        await self.provider.reply("next explicit result")
+        text = str(request.messages)
+        updates = ["MODEL-UPDATE", *[f"TOOL-UPDATE-{i}" for i in range(3)]]
+        positions = [text.index(value) for value in updates]
+        self.assertEqual(positions, sorted(positions))
+        self.assertTrue(all(text.count(value) == 1 for value in updates))
+        self.assertEqual(self.tool.calls, 1)
+        await self.provider.reply("updated answer")
+        finished = await self.runtime.wait_for(lambda e: e["type"] == "generation.finished", 3)
+        self.assertEqual(finished["input_ids"], ["original", "model", "tool-0", "tool-1", "tool-2"])
+
+    async def test_stop_during_final_checkpoint_does_not_resume_pending_steer(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def checkpoint():
+            entered.set()
+            await release.wait()
+        self.session.coordinator.register_capability("live.checkpoint", checkpoint)
+        await self.provider.reply("answer")
+        await asyncio.wait_for(entered.wait(), 3)
+        await self.runtime.submit_steering(Input("steer", "NO REPLAY", id="late"), self.runtime.generation["id"])
+        await self.runtime.submit(Input("stop", target="cancel"))
+        release.set()
+        await asyncio.wait_for(self.task, 3)
+        self.assertTrue(self.provider.requests.empty())
+        self.assertEqual(self.runtime.steering_outcomes["late"]["disposition"], "held")
+
+    async def test_admission_closes_before_terminal_publication_awaits(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        context = self.session.coordinator.get("context")
+        original = context.get_messages
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def messages():
+            if self.runtime.steering_closed:
+                entered.set()
+                await release.wait()
+            return await original()
+        context.get_messages = messages
+        await self.provider.reply("done")
+        await asyncio.wait_for(entered.wait(), 3)
+        with self.assertRaisesRegex(ValueError, "finishing"):
+            await self.runtime.submit_steering(Input("steer", "TOO LATE", id="late"), generation)
+        self.assertNotIn("late", self.runtime.accepted)
+        release.set()
+        await self.runtime.wait_for(lambda e: e["type"] == "generation.finished", 3)
+        self.assertTrue(self.provider.requests.empty())
+
+    async def test_exhausted_budget_does_not_resume_checkpoint_steer(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        async def checkpoint():
+            self.loop._budget_exhausted = True
+            await self.runtime.submit_steering(Input("steer", "WAIT", id="late"), self.runtime.generation["id"])
+        self.session.coordinator.register_capability("live.checkpoint", checkpoint)
+        await self.provider.reply("budget summary")
+        await self.runtime.wait_for(lambda e: e["type"] == "generation.finished", 3)
+        self.assertEqual(self.runtime.steering_outcomes["late"]["disposition"], "held")
+        self.assertTrue(self.provider.requests.empty())
 
     async def test_cancellation_holds_only_not_yet_injected_anchored_work(self):
         await self.start()
@@ -187,6 +268,24 @@ class BundleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("input_pending", str(request.messages))
         self.assertEqual(self.tool.calls, 1)
         await self.provider.reply("accepted correction")
+
+    async def test_anchored_input_wakes_job_wait_without_stopping_child(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "background task"))
+        await self.provider.request()
+        generation = self.runtime.generation['id']
+        await self.provider.reply(calls=[ToolCall(id="background", name="delegate", arguments={"async": True})])
+        await self.provider.request()
+        job_id = next(iter(self.loop.jobs))
+        await self.provider.reply(calls=[ToolCall(id="wait", name="live_job", arguments={"action": "wait", "job_id": job_id, "timeout": 60})])
+        await self.runtime.wait_for(lambda e: e['type'] == 'tool.pre' and e.get('tool') == 'live_job', 3)
+        await self.runtime.submit_steering(Input('steer', 'NEW GUIDANCE', id='steer'), generation)
+        request = await self.provider.request()
+        self.assertIn('NEW GUIDANCE', str(request.messages))
+        self.assertIn('input_pending', str(request.messages))
+        self.assertFalse(self.loop.jobs[job_id]['task'].done())
+        self.assertEqual(self.tool.calls, 1)
+        await self.provider.reply('guidance received while child runs')
 
     async def test_explicit_sync_overrides_legacy_background_default(self):
         await self.start()
