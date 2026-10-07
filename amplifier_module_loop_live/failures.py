@@ -25,7 +25,17 @@ def turn_failure(error, stage="manager_turn"):
     module = origin.tb_frame.f_globals.get("__name__", "") if origin else ""
     local_context = (module.startswith("amplifier_module_context_")
                      or module == "amplifier_module_loop_streaming")
-    if isinstance(error, ContextLengthError):
+    compaction = (type(error).__module__ == "amplifier_module_context_managed.errors"
+                  and type(error).__name__ == "CompactionError")
+    code = getattr(error, "code", None) if compaction else None
+    safe_codes = {"native_input_oversized", "native_checkpoint_invalid", "native_no_reduction",
+                  "native_measurement_unavailable", "native_compaction_failed",
+                  "disabled", "request_context_unavailable", "invalid_native_contract",
+                  "authoritative_measurement_unavailable"}
+    if compaction:
+        category, stage = "context_compaction", "context_preparation"
+        message = "Context compaction failed. Original history is preserved; repair context preparation before continuing."
+    elif isinstance(error, ContextLengthError):
         category = "context_limit"
         if local_context:
             stage = "context_preparation"
@@ -49,7 +59,8 @@ def turn_failure(error, stage="manager_turn"):
     # Class names from arbitrary third-party exceptions are not trusted text.
     kind = next((cls.__name__ for cls in type(error).__mro__
                  if cls.__module__ in {"builtins", "amplifier_core.llm_errors"}), "Exception")
-    return {"error_type": kind, "error_category": category, "error_stage": stage,
+    return {**({"error_code": code} if code in safe_codes else {}),
+            "error_type": "CompactionError" if compaction else kind, "error_category": category, "error_stage": stage,
             "error_message": message, "effects": "not_rolled_back", "replayed": False,
             "retryable": isinstance(error, LLMError) and error.retryable is True}
 

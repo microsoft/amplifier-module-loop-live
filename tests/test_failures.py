@@ -57,3 +57,19 @@ async def test_local_failure_keeps_cause_and_identity_without_provider_error_or_
     assert 'generation.finished' not in [e['type'] for e in runtime.events]
     assert 'secret-key' not in json.dumps(runtime.events)
     loop._execute_guarded_goal.assert_awaited_once()
+
+
+@pytest.mark.parametrize('code', ['native_input_oversized', 'private payload'])
+def test_compaction_failure_preserves_bounded_code_without_optional_dependency(code):
+    error_class = type('CompactionError', (RuntimeError,), {
+        '__module__': 'amplifier_module_context_managed.errors'})
+    error = error_class('secret transcript and SDK response')
+    error.code = code
+    failure = turn_failure(error)
+    assert failure['error_category'] == 'context_compaction'
+    assert failure['error_stage'] == 'context_preparation'
+    assert failure['error_type'] == 'CompactionError'
+    assert failure.get('error_code') == ('native_input_oversized' if code != 'private payload' else None)
+    assert 'secret' not in json.dumps(failure)
+    assert 'private payload' not in json.dumps(failure)
+    assert failure['retryable'] is False
