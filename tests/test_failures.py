@@ -73,3 +73,28 @@ def test_compaction_failure_preserves_bounded_code_without_optional_dependency(c
     assert 'secret' not in json.dumps(failure)
     assert 'private payload' not in json.dumps(failure)
     assert failure['retryable'] is False
+
+
+def test_token_count_failure_has_safe_diagnostic_without_generation_retry():
+    from amplifier_core.llm_errors import LLMError
+    cls = type('TokenCountError', (LLMError,), {'__module__': 'amplifier_module_provider_openai._token_count'})
+    error = cls('private SDK body', provider='openai', retryable=False)
+    error.count_failure = {'category': 'service', 'retryable': True, 'httpStatus': 503,
+                           'attempts': 3, 'requestId': 'req_123', 'body': 'SECRET'}
+    result = turn_failure(error)
+    assert result['error_category'] == 'context_measurement'
+    assert result['error_stage'] == 'context_preparation'
+    assert result['retryable'] is True and error.retryable is False
+    assert result['count_failure'] == {k: v for k, v in error.count_failure.items() if k != 'body'}
+    assert 'SECRET' not in json.dumps(result) and 'private' not in json.dumps(result)
+
+
+def test_token_count_diagnostic_rejects_unknown_values():
+    cls = type('TokenCountError', (RuntimeError,), {'__module__': 'amplifier_module_provider_openai._token_count'})
+    error = cls('secret')
+    error.count_failure = {'category': 'secret', 'retryable': True, 'httpStatus': True,
+                           'attempts': 999, 'requestId': 'https://secret@example.com'}
+    result = turn_failure(error)
+    assert result['count_failure'] == {'retryable': False}
+    assert not result['retryable']
+    assert 'secret' not in json.dumps(result)

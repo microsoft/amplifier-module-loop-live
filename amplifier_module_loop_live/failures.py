@@ -1,5 +1,7 @@
 """Bounded public turn failures; exception payloads remain private causes."""
 
+import re
+
 from amplifier_core.llm_errors import (
     AuthenticationError,
     ContentFilterError,
@@ -10,6 +12,30 @@ from amplifier_core.llm_errors import (
     ProviderUnavailableError,
     RateLimitError,
 )
+
+
+def count_diagnostic(error):
+    """Recognize an optional provider contract without importing its SDK."""
+    if (type(error).__module__, type(error).__name__) != (
+            'amplifier_module_provider_openai._token_count', 'TokenCountError'):
+        return None
+    value = getattr(error, 'count_failure', None)
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    if isinstance(value.get('category'), str) and value['category'] in {'timeout', 'connection', 'rate_limit', 'service',
+                                'authentication', 'permission', 'quota', 'invalid_request', 'invalid_response'}:
+        result['category'] = value['category']
+    result['retryable'] = value.get('retryable') is True and result.get('category') in {
+        'timeout', 'connection', 'rate_limit', 'service'}
+    for key, low, high in [('httpStatus', 400, 599), ('attempts', 1, 3)]:
+        number = value.get(key)
+        if type(number) is int and low <= number <= high:
+            result[key] = number
+    request_id = value.get('requestId')
+    if isinstance(request_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,100}', request_id):
+        result['requestId'] = request_id
+    return result
 
 
 def turn_failure(error, stage="manager_turn"):
@@ -32,7 +58,11 @@ def turn_failure(error, stage="manager_turn"):
                   "native_measurement_unavailable", "native_compaction_failed",
                   "disabled", "request_context_unavailable", "invalid_native_contract",
                   "authoritative_measurement_unavailable"}
-    if compaction:
+    count_failure = count_diagnostic(error)
+    if count_failure is not None:
+        category, stage = 'context_measurement', 'context_preparation'
+        message = 'Could not check conversation size. Saved history and checkpoint are preserved.'
+    elif compaction:
         category, stage = "context_compaction", "context_preparation"
         message = "Context compaction failed. Original history is preserved; repair context preparation before continuing."
     elif isinstance(error, ContextLengthError):
@@ -60,9 +90,11 @@ def turn_failure(error, stage="manager_turn"):
     kind = next((cls.__name__ for cls in type(error).__mro__
                  if cls.__module__ in {"builtins", "amplifier_core.llm_errors"}), "Exception")
     return {**({"error_code": code} if code in safe_codes else {}),
+            **({'count_failure': count_failure} if count_failure is not None else {}),
             "error_type": "CompactionError" if compaction else kind, "error_category": category, "error_stage": stage,
             "error_message": message, "effects": "not_rolled_back", "replayed": False,
-            "retryable": isinstance(error, LLMError) and error.retryable is True}
+            "retryable": (count_failure.get('retryable', False) if count_failure is not None
+                          else isinstance(error, LLMError) and error.retryable is True)}
 
 
 class ManagerTurnError(RuntimeError):
