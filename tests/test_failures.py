@@ -59,7 +59,8 @@ async def test_local_failure_keeps_cause_and_identity_without_provider_error_or_
     loop._execute_guarded_goal.assert_awaited_once()
 
 
-@pytest.mark.parametrize('code', ['native_input_oversized', 'private payload'])
+@pytest.mark.parametrize('code', ['native_input_oversized', 'summary_output_limit', 'summary_empty',
+    'previous_failure', 'summary_failed', 'native_failed', 'private payload', {'secret': 'value'}])
 def test_compaction_failure_preserves_bounded_code_without_optional_dependency(code):
     error_class = type('CompactionError', (RuntimeError,), {
         '__module__': 'amplifier_module_context_managed.errors'})
@@ -69,7 +70,7 @@ def test_compaction_failure_preserves_bounded_code_without_optional_dependency(c
     assert failure['error_category'] == 'context_compaction'
     assert failure['error_stage'] == 'context_preparation'
     assert failure['error_type'] == 'CompactionError'
-    assert failure.get('error_code') == ('native_input_oversized' if code != 'private payload' else None)
+    assert failure.get('error_code') == (code if isinstance(code, str) and code != 'private payload' else None)
     assert 'secret' not in json.dumps(failure)
     assert 'private payload' not in json.dumps(failure)
     assert failure['retryable'] is False
