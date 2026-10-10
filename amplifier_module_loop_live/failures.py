@@ -57,7 +57,8 @@ def turn_failure(error, stage="manager_turn"):
     safe_codes = {"native_input_oversized", "native_checkpoint_invalid", "native_no_reduction",
                   "native_measurement_unavailable", "native_compaction_failed",
                   "disabled", "request_context_unavailable", "invalid_native_contract",
-                  "authoritative_measurement_unavailable"}
+                  "authoritative_measurement_unavailable", "summary_output_limit", "summary_empty",
+                  "previous_failure", "summary_failed", "native_failed"}
     count_failure = count_diagnostic(error)
     if count_failure is not None:
         category, stage = 'context_measurement', 'context_preparation'
@@ -89,7 +90,7 @@ def turn_failure(error, stage="manager_turn"):
     # Class names from arbitrary third-party exceptions are not trusted text.
     kind = next((cls.__name__ for cls in type(error).__mro__
                  if cls.__module__ in {"builtins", "amplifier_core.llm_errors"}), "Exception")
-    return {**({"error_code": code} if code in safe_codes else {}),
+    return {**({"error_code": code} if isinstance(code, str) and code in safe_codes else {}),
             **({'count_failure': count_failure} if count_failure is not None else {}),
             "error_type": "CompactionError" if compaction else kind, "error_category": category, "error_stage": stage,
             "error_message": message, "effects": "not_rolled_back", "replayed": False,
