@@ -19,7 +19,6 @@ from .provenance import InputContext, ContinuationContext, input_metadata
 from .job_store import serialize_result
 from .host import HostAdapter, AttachmentContext
 from .scope import HOST_ADAPTER
-from .dispatch import ApprovedDispatch
 from .failures import ManagerTurnError, turn_failure
 
 _WAKE = "[loop-live inbox wake]"
@@ -35,7 +34,12 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         self.load_failures = []
         self.running = False
         self.root_provider = None
-        self.approved_dispatch = ApprovedDispatch(self)
+        # Live activation belongs to this adapter. The shared execution service
+        # accepts only a generic host-validity callback.
+        def dispatch_context_valid(coordinator):
+            activation = coordinator.get_capability("live.activation")
+            return activation is None or activation.current_valid is True
+        self.approved_dispatch.validate_context = dispatch_context_valid
 
     async def _execute_guarded_goal(self, prompt, context, providers, tools, hooks, coordinator):
         # An explicit input always receives its first turn. Only automatic goal
@@ -442,13 +446,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             job["task"].cancel()
 
     async def _execute_tool_only(self, tool_call, tools, hooks, parallel_group_id, coordinator=None):
-        if not self.approved_dispatch.enabled:
-            return await self._execute_tool_scoped(tool_call, tools, hooks, parallel_group_id, coordinator)
-        tools = self.approved_dispatch.wrap_tools(tools)
-        with self.approved_dispatch.call_scope(tool_call, tools, hooks, parallel_group_id):
-            return await self._execute_tool_scoped(tool_call, tools, hooks, parallel_group_id, coordinator)
-
-    async def _execute_tool_scoped(self, tool_call, tools, hooks, parallel_group_id, coordinator=None):
         arguments = tool_call.arguments or {}
         eligible = tool_call.name in self.config.get("background_tools", ["delegate"])
         default = bool(self.config.get("background_delegate") and tool_call.name == "delegate")
@@ -534,6 +531,9 @@ async def mount(coordinator, config=None):
     coordinator.register_capability("session.steer", loop.steer)
     coordinator.register_capability("live.continuation_guard_supported", True)
     coordinator.register_capability("tools.dispatch", loop.approved_dispatch)
+    coordinator.register_capability("model.complete", loop.approved_dispatch.complete)
+    coordinator.register_contributor("observability.events", "loop-live-programmatic",
+        lambda: ["model:complete", "tool:dispatch_cancelled"])
     coordinator.register_capability("conversation.provider_pin", ConversationProviderPin(loop, coordinator))
     # Portable consumers reuse the current ordinary provider (including a host
     # pin) without importing this loop or reading its private selection state.
