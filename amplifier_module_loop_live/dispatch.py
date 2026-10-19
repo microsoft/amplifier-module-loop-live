@@ -112,7 +112,9 @@ class DispatchLease:
             name
             for name in scope.tools
             if name not in FORBIDDEN
+            and name not in dispatcher.callers
             and getattr(scope.tools[name], "name", name) not in FORBIDDEN
+            and getattr(scope.tools[name], "name", name) not in dispatcher.callers
             and (allowlist is None or name in allowlist)
         )
         self.context = {
@@ -130,6 +132,7 @@ class DispatchLease:
         if (
             self.closed
             or not self.dispatcher.enabled
+            or self.scope.call.name not in self.dispatcher.callers
             or not self.scope.active
             or not self.scope.run.active
             or run is not self.scope.run
@@ -259,6 +262,14 @@ class ApprovedDispatch:
     def enabled(self):
         return self.owner.config.get("programmatic_dispatch", False) is True
 
+    @property
+    def callers(self):
+        """Host-selected controllers; ordinary configuration permits only tool_exec."""
+        names = self.owner.config.get("programmatic_callers", ["tool_exec"])
+        if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+            return frozenset()
+        return frozenset(name for name in names if name == "tool_exec" or name not in FORBIDDEN)
+
     @contextmanager
     def run_scope(self, coordinator):
         run = Run(self, coordinator, str(uuid4()))
@@ -290,13 +301,13 @@ class ApprovedDispatch:
         if (
             not self.enabled
             or scope is None
-            or scope.call.name != "tool_exec"
+            or scope.call.name not in self.callers
             or not scope.active
             or not scope.run.active
             or scope.run.owner is not self
             or scope.run.coordinator is None
         ):
-            raise RuntimeError("No active authorized tool_exec call")
+            raise RuntimeError("No active authorized programmatic caller")
         lease = DispatchLease(self, scope)
         lease._valid()
         return lease

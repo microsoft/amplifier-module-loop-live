@@ -535,6 +535,9 @@ async def mount(coordinator, config=None):
     coordinator.register_capability("live.continuation_guard_supported", True)
     coordinator.register_capability("tools.dispatch", loop.approved_dispatch)
     coordinator.register_capability("conversation.provider_pin", ConversationProviderPin(loop, coordinator))
+    # Portable consumers reuse the current ordinary provider (including a host
+    # pin) without importing this loop or reading its private selection state.
+    coordinator.register_capability("model.current", lambda: loop._select_provider(coordinator.get("providers")))
     async def failed(event, data):
         # Older Core versions omit the category. Never forward their raw error.
         reason = data.get("reason_code")
