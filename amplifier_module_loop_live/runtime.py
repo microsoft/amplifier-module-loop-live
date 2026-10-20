@@ -69,6 +69,34 @@ class Runtime:
         self.steering_wake = None
         self.steering_closed = False
         self.stop_requested = False
+        self.pause_epoch = None
+        self.suspended = None
+        self.pause_origin = None
+        self.pause_terminal = None
+
+    async def request_pause(self, epoch):
+        """Hold admission immediately; the engine proves its settled boundary."""
+        if not isinstance(epoch, str) or not epoch or len(epoch) > 128:
+            raise ValueError("A bounded maintenance epoch is required")
+        if self.pause_epoch not in {None, epoch}:
+            raise RuntimeError("A different maintenance epoch already owns this runtime")
+        if self.pause_epoch is None:
+            self.pause_origin = copy.deepcopy(self.generation)
+            self.pause_terminal = None
+        self.pause_epoch = epoch
+        self.inbox.put_nowait(("maintenance_pause", epoch))
+        await self.emit("maintenance.requested", epoch=epoch)
+
+    async def release_paused(self, epoch):
+        if self.pause_epoch != epoch:
+            raise RuntimeError("Maintenance epoch changed")
+        self.inbox.put_nowait(("maintenance_release", epoch))
+
+    async def resume_paused(self, epoch):
+        """Host-authorized intent; the loop still checks each continuation owner."""
+        if self.pause_epoch != epoch:
+            raise RuntimeError("Maintenance epoch changed")
+        self.inbox.put_nowait(("maintenance_resume", epoch))
 
     async def submit(self, command: Input):
         if self.closed:
@@ -92,6 +120,8 @@ class Runtime:
             if previous != command:
                 raise ValueError("Command identity reused with different content")
             return command.id
+        if self.pause_epoch and command.kind in {"user", "steer"}:
+            raise RuntimeError("New work is held for maintenance")
         if command.target_generation_id is not None:
             if command.kind != "steer" or not isinstance(command.target_generation_id, str) or not 1 <= len(command.target_generation_id) <= 128:
                 raise ValueError("A bounded generation anchor is only valid for steering")
@@ -182,6 +212,8 @@ class Runtime:
         async with self.changed:
             self.changed.notify_all()
         if event_type in {"generation.finished", "generation.failed", "generation.detached"}:
+            if self.pause_epoch and self.generation:
+                self.pause_terminal = copy.deepcopy(self.generation)
             self.generation = None
         return event
 
