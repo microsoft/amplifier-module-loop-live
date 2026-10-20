@@ -201,6 +201,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         native = self._select_provider(providers)
         self.host.prepare_provider(native, coordinator)
         native = native if getattr(native, "native_bundle_live", False) else None
+        runtime.execution_suspension_support = native is None
         runtime.anchored_steering_mode = "unavailable" if native else "request_boundary"
         runtime.steering_wake = lambda: self.steer(_WAKE)
         coordinator.register_capability("live.steering", {"version": 1,
@@ -278,6 +279,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             runtime.pause_epoch = restored["epoch"]
             runtime.pause_origin = restored.get("pause_origin")
             runtime.pause_terminal = restored.get("pause_terminal")
+            runtime.pause_jobs = restored.get("pause_jobs", {})
             runtime.generation = restored.get("generation")
             runtime.suspended = restored.get("turn")
             self.pending.extend(restored_input(row) for row in restored.get("pending", []))
@@ -285,6 +287,9 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             runtime.pending_steering.extend(restored_input(row) for row in restored.get("steering", []))
             runtime.steering_outcomes.update(restored.get("steering_outcomes", {}))
             runtime.steering_closed = restored.get("steering_closed", False)
+            runtime.owned_jobs = {row["job_id"]: dict(row) for row in
+                [*restored.get("jobs", []), *runtime.pause_jobs.values()]}
+        self.pending_job_results = dict((restored or {}).get("pending_job_results", {}))
 
         async def paused_checkpoint():
             save = coordinator.get_capability("live.suspend")
@@ -294,6 +299,9 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 return {key: value for key, value in vars(command).items() if key != "activation"}
             envelope = {"version": 1, "epoch": runtime.pause_epoch,
                         "pause_origin": runtime.pause_origin, "pause_terminal": runtime.pause_terminal,
+                        "pause_jobs": runtime.pause_jobs,
+                        "pending_job_results": {command.id: self.pending_job_results[command.id]
+                            for command in self.pending if command.id in self.pending_job_results},
                         "generation": runtime.generation, "turn": runtime.suspended,
                         "pending": [command_data(row) for row in self.pending],
                         "accepted": [command_data(row) for row in runtime.accepted.values()],
@@ -324,10 +332,12 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     await self._hold_anchored("generation-ended")
                 if active is None and self.pending and runtime.inbox.empty() and not runtime.pause_epoch:
                     command = self.pending.popleft()
+                    origin = self.pending_job_results.pop(command.id, None)
                     # Publish busy state before scheduling: a host control can
                     # otherwise park after dequeue but before turn() first runs.
                     await runtime.emit("generation.started", generation_id=str(uuid.uuid4()),
-                                       initial_input_id=command.id, call_id=command.call_id)
+                                       initial_input_id=command.id, call_id=command.call_id,
+                                       **({"result_origin": origin} if origin else {}))
                     active = asyncio.create_task(turn(command))
                     idle = False
                 if active is None and not self.pending and not self._active_jobs() and runtime.inbox.empty() and not idle and not runtime.pause_epoch:
@@ -379,6 +389,16 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     # turn keeps its generation and original input identity.
                     saved = runtime.suspended
                     runtime.pause_epoch, runtime.suspended = None, None
+                    # Durable inputs never contain a process-local writer
+                    # token. Only the explicit, admitted continuation handoff
+                    # may bind their original identities to this acquisition.
+                    if activation:
+                        from dataclasses import replace
+                        self.pending = deque(replace(command, activation=activation.current())
+                                             for command in self.pending)
+                        runtime.pending_steering = deque(
+                            replace(command, activation=activation.current())
+                            for command in runtime.pending_steering)
                     if saved:
                         command = restored_input(saved["command"])
                         if activation:
@@ -406,6 +426,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     idle = False
                     continue
                 if kind == "bundle_job_suspended":
+                    if value in runtime.pause_jobs:
+                        runtime.pause_jobs[value]["status"] = "paused"
                     idle = False
                     continue
                 if kind == "input":
@@ -659,9 +681,13 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         if deliver:
             self._pending_ephemeral_injections.extend(injections)
             activation = self.coordinator.get_capability("live.activation")
-            self.pending.append(Input("service", json.dumps({"job_id": job_id,
+            command = Input("service", json.dumps({"job_id": job_id,
                 "call_id": job["call_id"], "status": outcome, "tool_report": result}), source="amplifier-delegate",
-                activation=activation.current() if activation else None))
+                activation=activation.current() if activation else None)
+            self.pending.append(command)
+            self.pending_job_results[command.id] = {"jobId": job_id, "callId": job["call_id"]}
+            await self.runtime.emit("job.result_queued", input_id=command.id, job_id=job_id,
+                                    call_id=job["call_id"])
             self.steer(_WAKE)
 
 
