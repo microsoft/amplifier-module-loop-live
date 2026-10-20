@@ -57,6 +57,9 @@ approval policy, transport authentication, persistence location, and shutdown.
 Runtime history is bounded observation, not a replay log. Saved interrupted jobs
 are evidence and are never automatically dispatched again.
 
+[Cooperative execution suspension](docs/execution-suspension.md) is a separate
+opt-in path for acknowledged safe boundaries and explicit once-only resumption.
+
 `JobStore.recover(transcript)` compares each saved call and result with the
 checkpoint. A returned job whose exact evidence is already present reconciles
 silently; the absence of an old display notice is not a recovery event. Missing

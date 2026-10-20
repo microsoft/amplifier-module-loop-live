@@ -68,17 +68,32 @@ class JobStore:
                 os.unlink(temporary)
         self.rows[row["call_id"]] = row
 
-    def begin(self, call, job_id, receipt, native_call=None):
+    def begin(self, call, job_id, receipt, native_call=None, *, generation=None):
         if call.id in self.rows:
             raise RuntimeError("Saved tool call identity cannot be dispatched again")
         self._write({"version": 1, "job_id": job_id, "call_id": call.id, "tool_call": call.model_dump(),
-                     "native_call": native_call, "receipt": receipt, "status": "pending"})
+                     "native_call": native_call, "receipt": receipt, "status": "pending",
+                     "generation": copy.deepcopy(generation)})
 
     def finish(self, call_id, result, outcome):
         row = self.rows[call_id]
         if row["status"] != "pending":
             raise RuntimeError("Saved job already has a terminal report")
         self._write({**row, "status": outcome, "result": serialize_result(result, outcome)})
+
+    def suspend(self, call_id, continuation):
+        row = self.rows[call_id]
+        if row["status"] != "pending":
+            raise RuntimeError("Only a pending job can suspend")
+        self._write({**row, "status": "paused", "continuation": copy.deepcopy(continuation)})
+
+    def resume_paused(self, call_id, continuation):
+        row = self.rows[call_id]
+        if row["status"] != "paused" or row.get("continuation") != continuation:
+            raise RuntimeError("Job continuation changed or was already consumed")
+        # Consume durably before invocation. A crash afterward is uncertain,
+        # never a reason to replay the paused continuation.
+        self._write({**row, "status": "pending", "continuation": None})
 
     def recover(self, transcript):
         """Reconcile saved evidence without redispatching work.
@@ -91,6 +106,11 @@ class JobStore:
         recovered = []
         for identity, original in list(self.rows.items()):
             row = original
+            if row["status"] == "paused":
+                # A host must explicitly admit this exact continuation. Keep
+                # its original receipt; neither synthesize completion nor
+                # invoke the tool while restoring saved history.
+                continue
             changed = False
             if row["status"] == "pending":
                 row = {**row, "status": "interrupted", "result": json.dumps({

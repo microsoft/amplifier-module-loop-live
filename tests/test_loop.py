@@ -433,7 +433,7 @@ class BundleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dispatch_does_not_run_when_intent_cannot_be_saved(self):
         await self.start()
-        ledger = SimpleNamespace(begin=lambda *args: (_ for _ in ()).throw(OSError("disk unavailable")))
+        ledger = SimpleNamespace(begin=lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk unavailable")))
         self.session.coordinator.register_capability("live.jobs", ledger)
         with self.assertRaises(OSError):
             await self.loop._execute_tool_only(ToolCall(id="no-save", name="delegate", arguments={}),
