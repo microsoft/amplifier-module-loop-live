@@ -57,6 +57,12 @@ approval policy, transport authentication, persistence location, and shutdown.
 Runtime history is bounded observation, not a replay log. Saved interrupted jobs
 are evidence and are never automatically dispatched again.
 
+If a provider, hook, or host guard cancels an active turn, the live owner settles
+through the same cancellation cleanup as Stop. It emits `generation.detached`
+with cancellation unconfirmed and `session.closed` with cancelled status; it
+does not report success or replay completed tools. Hosts must still reconcile
+external effects before resuming interrupted work.
+
 `JobStore.recover(transcript)` compares each saved call and result with the
 checkpoint. A returned job whose exact evidence is already present reconciles
 silently; the absence of an old display notice is not a recovery event. Missing
