@@ -38,6 +38,34 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         self.root_provider = None
         self.approved_dispatch = ApprovedDispatch(self)
 
+    @staticmethod
+    def _validate_suspended_envelope(envelope, ledger):
+        """Validate portable format and durable job ownership before restore."""
+        if not isinstance(envelope, dict) or type(envelope.get("version")) is not int or envelope["version"] != 1:
+            raise ValueError("Unsupported live suspension envelope version")
+        epoch = envelope.get("epoch")
+        if not isinstance(epoch, str) or not 1 <= len(epoch) <= 128:
+            raise ValueError("Invalid live suspension epoch")
+        jobs = envelope.get("jobs", [])
+        if not isinstance(jobs, list) or any(not isinstance(row, dict) for row in jobs):
+            raise ValueError("Invalid live suspension jobs")
+        paused = {row["job_id"]: row for row in (ledger.rows.values() if ledger else ())
+                  if row.get("status") == "paused"}
+        if jobs and ledger is None:
+            raise RuntimeError("Paused background jobs require a durable live.jobs ledger")
+        seen = set()
+        for job in jobs:
+            identity = job.get("job_id")
+            row = paused.get(identity) if isinstance(identity, str) else None
+            if (row is None or identity in seen or job.get("status") != "paused"
+                    or job.get("call_id") != row.get("call_id")
+                    or job.get("continuation") is None
+                    or job["continuation"] != row.get("continuation")):
+                raise RuntimeError("Suspended job does not match its durable ledger")
+            seen.add(identity)
+        if seen != set(paused):
+            raise RuntimeError("Suspension envelope omits a paused ledger job")
+
     async def _execute_guarded_goal(self, prompt, context, providers, tools, hooks, coordinator, resume=None):
         # An explicit input always receives its first turn. Only automatic goal
         # continuations consult the host at the last safe admission boundary.
@@ -177,6 +205,10 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 raise
         if self.running:
             raise RuntimeError("One execute owner per manager session")
+        ledger = coordinator.get_capability("live.jobs")
+        restored = coordinator.get_capability("live.suspended_execution")
+        if restored is not None:
+            self._validate_suspended_envelope(restored, ledger)
         self.running, self.runtime = True, runtime
         self.context, self.tools, self.hooks, self.coordinator = context, tools, hooks, coordinator
         from .jobs import AsyncTool, JobControl
@@ -189,7 +221,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             {"job_id": identity, "call_id": job["call_id"], "status": job.get("status", "pending"),
              "tool": (job.get("tool_call") or {}).get("name")}
             for identity, job in self.jobs.items() if job.get("result") is None])
-        ledger = coordinator.get_capability("live.jobs")
         if ledger:
             recovered = coordinator.get_capability("live.recovered_jobs") or []
             for row in ledger.rows.values():
@@ -272,7 +303,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     activation.reset(activation_token)
                 LIVE_OWNER.reset(owner_token)
 
-        restored = coordinator.get_capability("live.suspended_execution")
         def restored_input(row):
             return Input(**{**row, "attachments": tuple(row.get("attachments", ()))})
         if restored:
@@ -312,6 +342,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                                   "status": job.get("status"), "continuation": job.get("continuation"),
                                   "generation": job.get("generation")}
                                  for identity, job in self.jobs.items() if job.get("result") is None]}
+            self._validate_suspended_envelope(envelope, ledger)
             if await save(envelope) is not True:
                 raise RuntimeError("Live suspension checkpoint was not acknowledged")
             return envelope
@@ -413,7 +444,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                                 ledger.resume_paused(call.id, continuation)
                             job["status"] = "pending"
                             job["task"] = asyncio.create_task(self._run_background_job(
-                                job_id, call, tools, hooks, None, coordinator, continuation=continuation))
+                                job_id, call, tools, hooks, job.get("parallel_group_id"),
+                                coordinator, continuation=continuation))
                     idle = False
                     await runtime.emit("session.resumed", epoch=value)
                     continue
@@ -613,11 +645,12 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             provider = NATIVE_REQUEST.get()
             ledger.begin(tool_call, job_id, receipt,
                          provider.async_calls.get(tool_call.id) if provider else None,
-                         generation=runtime.generation)
+                         generation=runtime.generation, parallel_group_id=parallel_group_id)
 
 
         self.jobs[job_id] = {"task": asyncio.create_task(self._run_background_job(job_id, tool_call, tools, hooks, parallel_group_id, coordinator)), "call_id": tool_call.id,
                              "tool_call": tool_call.model_dump(), "receipt": receipt, "status": "pending",
+                             "parallel_group_id": parallel_group_id,
                              "generation": __import__("copy").deepcopy(runtime.generation)}
         self._tool_calls_this_turn += 1
         origin = self.jobs[job_id]["generation"] or {}

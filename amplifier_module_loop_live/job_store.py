@@ -68,11 +68,12 @@ class JobStore:
                 os.unlink(temporary)
         self.rows[row["call_id"]] = row
 
-    def begin(self, call, job_id, receipt, native_call=None, *, generation=None):
+    def begin(self, call, job_id, receipt, native_call=None, *, generation=None, parallel_group_id=None):
         if call.id in self.rows:
             raise RuntimeError("Saved tool call identity cannot be dispatched again")
         self._write({"version": 1, "job_id": job_id, "call_id": call.id, "tool_call": call.model_dump(),
                      "native_call": native_call, "receipt": receipt, "status": "pending",
+                     "parallel_group_id": parallel_group_id,
                      "generation": copy.deepcopy(generation)})
 
     def finish(self, call_id, result, outcome):

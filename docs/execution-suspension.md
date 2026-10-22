@@ -35,6 +35,20 @@ approved continuation and paused jobs. The original delegate's `resume_execution
 owns child result completion. Saved stopped/claimed/unknown work is not replayed.
 Ordinary crash recovery without an acknowledged pause remains evidence-only.
 
+Durable suspension of background jobs additionally requires `live.jobs`. The
+loop refuses to acknowledge a checkpoint with paused background jobs unless its
+ledger contains the matching job/call/continuation records. Fresh remount rejects
+missing, extra, or inconsistent paused ledger jobs before restoring runtime state.
+Ledger-free ordinary execution and suspension with no background jobs remain
+supported. The outer envelope must have version 1 and a valid maintenance epoch;
+the host still owns binding that private envelope to the correct session.
+
+New background ledger records preserve `parallel_group_id` through resumption.
+Older records without that optional field retain `None`; recovery does not invent
+an original correlation identity. Shared maintenance admission authorizes the
+set of owned work; each engine/tool still enforces its own continuation claim.
+`session.resumed` reports that handoff, not successful completion of every claim.
+
 Hosts must distinguish waiting, acknowledged suspension, unsupported engines and
 uncertain persistence/hand-off. An arbitrary hanging tool cannot safely be
 cancelled by this protocol. Separate emergency process stopping can lose remote
