@@ -61,7 +61,7 @@ dev = [
 [[package]]
 name = "amplifier-module-loop-streaming"
 version = "1.0.0"
-source = { git = "https://github.com/microsoft/amplifier-module-loop-streaming?rev=main#9e5d4ff07c7f57fbdf233b869d94e18c910d83b9" }
+source = { git = "https://github.com/microsoft/amplifier-module-loop-streaming?rev=main#e04bba7e85bff9836bfc48cd8ac1db676f4f5fab" }
 
 [[package]]
 name = "annotated-types"
