@@ -53,4 +53,4 @@ jobs:
       - name: Require the native provider and verify adapter boundaries offline
         run: |
           uv run --no-sync python -c 'from amplifier_module_provider_openai.native import NativeResponsesProvider'
-          uv run --no-sync pytest -q tests/test_native_provider_adapter.py tests/test_native_provider_budget_compatibility.py tests/test_native_job_attribution.py tests/test_native_adapter_fallback.py tests/test_image_budget.py
+          uv run --no-sync pytest -q tests/test_native_provider_adapter.py tests/test_native_history_options.py tests/test_native_provider_budget_compatibility.py tests/test_native_job_attribution.py tests/test_native_adapter_fallback.py tests/test_image_budget.py

@@ -39,23 +39,25 @@ class ComputerResultError(LLMError):
         super().__init__(self.public_message, provider="openai", retryable=False)
 
 
-def failed_computer_history(messages):
+def failed_computer_history(messages, *, ordinary_names=frozenset()):
     """Represent an old failure as evidence only after a subsequent user message.
 
     The saved transcript is untouched. A failed native call cannot receive a
     made-up screenshot; the next user turn starts a new Responses lineage with
     an explicit failure record carrying the original identity and result.
     """
+    # The provider owns native eligibility. An ordinary tool may share the
+    # computer name and actions-shaped arguments without returning screenshots.
     native = set()
     for message in messages:
         for call in message.get("tool_calls") or []:
             name=call.get("tool") or call.get("name")
             args=call.get("arguments") or call.get("input") or {}
-            if name=="computer" and isinstance(args,dict) and isinstance(args.get("actions"),list):
+            if name=="computer" and name not in ordinary_names and isinstance(args,dict) and isinstance(args.get("actions"),list):
                 native.add(call.get("id"))
         content=message.get("content")
         for block in content if isinstance(content,list) else []:
-            if isinstance(block,dict) and block.get("type")=="tool_call" and block.get("name")=="computer" and isinstance((block.get("input") or {}).get("actions"),list):
+            if isinstance(block,dict) and block.get("type")=="tool_call" and block.get("name")=="computer" and block.get("name") not in ordinary_names and isinstance((block.get("input") or {}).get("actions"),list):
                 native.add(block.get("id"))
     last_user=max((i for i,m in enumerate(messages) if m.get("role")=="user" and not (m.get("metadata") or {}).get("ephemeral")),default=-1)
     failures={}

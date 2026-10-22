@@ -21,7 +21,8 @@ class SafeOpenAIProvider(ImageBudgetMixin, OpenAIProvider):
 
     def _convert_messages(self, messages, **kwargs):
         from amplifier_loop_live_cli.computer_results import failed_computer_history,validate_computer_outputs
-        messages,_=failed_computer_history(messages)
+        messages,_=failed_computer_history(
+            messages, ordinary_names=kwargs.get("ordinary_computer_names", frozenset()))
         return validate_computer_outputs(super()._convert_messages(messages,**kwargs))
 
     async def complete(self, request, **kwargs):
@@ -47,9 +48,9 @@ class BundleAstraProvider(ImageBudgetMixin, NativeResponsesProvider):
         return super().wrap(original, owner_getter=LIVE_OWNER.get, trace=trace,
                             trace_context=trace_native_context)
 
-    def _prepare_native_messages(self, messages):
+    def _prepare_native_messages(self, messages, *, ordinary_names=frozenset()):
         from .computer_results import failed_computer_history
-        return failed_computer_history(messages)[0]
+        return failed_computer_history(messages, ordinary_names=ordinary_names)[0]
 
     def _validate_native_items(self, items):
         from .computer_results import validate_computer_outputs
