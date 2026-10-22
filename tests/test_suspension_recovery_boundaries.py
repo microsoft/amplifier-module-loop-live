@@ -39,7 +39,8 @@ async def start_or_fail(parts, tools=None):
     loop, runtime, coordinator, context, provider, _ = parts
     task = asyncio.create_task(loop.execute("", context, {"fixture": provider}, tools or {},
                                             coordinator.hooks, coordinator))
-    notice = asyncio.create_task(runtime.wait_for(lambda e: e["type"] == "session.suspended", 2))
+    notice = asyncio.create_task(runtime.wait_for(
+        lambda e: e["type"] in {"session.suspended", "session.idle"}, 2))
     try:
         done, _ = await asyncio.wait((task, notice), timeout=3, return_when=asyncio.FIRST_COMPLETED)
         assert done, "loop neither suspended nor refused"
@@ -92,13 +93,16 @@ async def test_no_ledger_cannot_acknowledge_paused_background_job():
         with pytest.raises(RuntimeError, match="ledger"):
             task = await start_or_fail(parts)
         capabilities["live.suspend"].assert_not_awaited()
+        assert runtime.closed and runtime.events[-1]["status"] == "error"
+        assert loop.jobs["job"]["continuation"] == {"version": 1, "child": "child"}
+        assert not any(e["type"] == "session.suspended" for e in runtime.events)
     finally:
         if task:
             await finish(task, runtime)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["missing", "continuation", "extra"])
+@pytest.mark.parametrize("change", ["missing", "continuation", "extra", "no-envelope", "generation"])
 async def test_restored_jobs_must_match_durable_ledger(tmp_path, change):
     store = JobStore(tmp_path / "jobs")
     call = ToolCall(id="call", name="effect", arguments={})
@@ -113,14 +117,20 @@ async def test_restored_jobs_must_match_durable_ledger(tmp_path, change):
         ledger = store
         if change == "continuation":
             row["continuation"] = {"version": 1, "child": "changed"}
-        else:
+        elif change == "extra":
             envelope["jobs"] = []
+        elif change == "generation":
+            row["generation"] = {"id": "different-generation"}
+        else:
+            envelope = None
     parts = setup(envelope, ledger)
     task = None
     try:
         with pytest.raises(RuntimeError, match="ledger"):
             task = await start_or_fail(parts)
         parts[5]["live.suspend"].assert_not_awaited()
+        assert store.rows[call.id]["status"] == "paused"
+        assert store.rows[call.id]["continuation"] == continuation
     finally:
         if task:
             await finish(task, parts[1])
@@ -168,4 +178,43 @@ async def test_two_paused_jobs_remount_once_with_original_group(tmp_path):
         assert len(resumed) == 2
     finally:
         await finish(task, runtime)
+        store.close()
+
+
+@pytest.mark.parametrize("epoch", [None, 7, "", "a" * 129])
+def test_invalid_epoch_refuses(epoch):
+    with pytest.raises(ValueError, match="epoch"):
+        BundleLiveOrchestrator._validate_suspended_envelope(
+            {"version": 1, "epoch": epoch}, None)
+
+
+@pytest.mark.parametrize("jobs", [None, {}, ["not-a-row"]])
+def test_invalid_job_collection_refuses(jobs):
+    with pytest.raises(ValueError, match="jobs"):
+        BundleLiveOrchestrator._validate_suspended_envelope(
+            {"version": 1, "epoch": "held", "jobs": jobs}, None)
+
+
+@pytest.mark.parametrize("change", ["duplicate", "call", "status", "null-continuation"])
+def test_invalid_job_reference_refuses(tmp_path, change):
+    store = JobStore(tmp_path)
+    call = ToolCall(id="call", name="effect", arguments={})
+    store.begin(call, "job", "receipt")
+    store.suspend(call.id, {"child": "held"})
+    row = {"job_id": "job", "call_id": "call", "status": "paused",
+           "continuation": {"child": "held"}}
+    envelope = {"version": 1, "epoch": "held", "jobs": [row]}
+    if change == "duplicate":
+        envelope["jobs"].append(dict(row))
+    elif change == "call":
+        row["call_id"] = "other"
+    elif change == "status":
+        row["status"] = "pending"
+    else:
+        row["continuation"] = None
+    try:
+        with pytest.raises(RuntimeError, match="ledger"):
+            BundleLiveOrchestrator._validate_suspended_envelope(envelope, store)
+        assert store.rows[call.id]["status"] == "paused"
+    finally:
         store.close()
