@@ -38,7 +38,9 @@ Ordinary crash recovery without an acknowledged pause remains evidence-only.
 Durable suspension of background jobs additionally requires `live.jobs`. The
 loop refuses to acknowledge a checkpoint with paused background jobs unless its
 ledger contains the matching job/call/continuation records. Fresh remount rejects
-missing, extra, or inconsistent paused ledger jobs before restoring runtime state.
+missing, extra, or inconsistent paused ledger jobs (including their generation)
+before restoring runtime state. Paused ledger rows without an outer envelope
+also refuse mounting; they remain held for host inspection, not redispatch.
 Ledger-free ordinary execution and suspension with no background jobs remain
 supported. The outer envelope must have version 1 and a valid maintenance epoch;
 the host still owns binding that private envelope to the correct session.

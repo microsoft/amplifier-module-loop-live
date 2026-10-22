@@ -49,8 +49,13 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         jobs = envelope.get("jobs", [])
         if not isinstance(jobs, list) or any(not isinstance(row, dict) for row in jobs):
             raise ValueError("Invalid live suspension jobs")
-        paused = {row["job_id"]: row for row in (ledger.rows.values() if ledger else ())
-                  if row.get("status") == "paused"}
+        paused = {}
+        for row in (ledger.rows.values() if ledger is not None else ()):
+            if row.get("status") == "paused":
+                identity = row.get("job_id")
+                if not isinstance(identity, str) or not identity or identity in paused:
+                    raise RuntimeError("Invalid paused ledger job identity")
+                paused[identity] = row
         if jobs and ledger is None:
             raise RuntimeError("Paused background jobs require a durable live.jobs ledger")
         seen = set()
@@ -59,6 +64,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             row = paused.get(identity) if isinstance(identity, str) else None
             if (row is None or identity in seen or job.get("status") != "paused"
                     or job.get("call_id") != row.get("call_id")
+                    or job.get("generation") != row.get("generation")
                     or job.get("continuation") is None
                     or job["continuation"] != row.get("continuation")):
                 raise RuntimeError("Suspended job does not match its durable ledger")
@@ -209,6 +215,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         restored = coordinator.get_capability("live.suspended_execution")
         if restored is not None:
             self._validate_suspended_envelope(restored, ledger)
+        elif ledger is not None and any(row.get("status") == "paused" for row in ledger.rows.values()):
+            raise RuntimeError("Paused ledger jobs require their suspension envelope")
         self.running, self.runtime = True, runtime
         self.context, self.tools, self.hooks, self.coordinator = context, tools, hooks, coordinator
         from .jobs import AsyncTool, JobControl
