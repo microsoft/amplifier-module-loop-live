@@ -303,6 +303,12 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             except ExecutionSuspended as paused:
                 await runtime.inbox.put(("bundle_suspended", (command, paused.continuation)))
             except asyncio.CancelledError:
+                # Cancellation can originate inside a provider, hook or host
+                # admission guard, without a Stop command in the live inbox.
+                # Wake the owner so awaiting this exact task propagates the
+                # cancellation through normal terminal cleanup instead of
+                # leaving an active generation waiting forever.
+                runtime.inbox.put_nowait(("bundle_turn", (None, None)))
                 raise
             except Exception as exc:
                 await runtime.inbox.put(("bundle_turn", (None, (exc, turn_failure(exc, stage)))))

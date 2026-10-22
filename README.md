@@ -60,6 +60,12 @@ are evidence and are never automatically dispatched again.
 [Cooperative execution suspension](docs/execution-suspension.md) is a separate
 opt-in path for acknowledged safe boundaries and explicit once-only resumption.
 
+If a provider, hook, or host guard cancels an active turn, the live owner settles
+through the same cancellation cleanup as Stop. It emits `generation.detached`
+with cancellation unconfirmed and `session.closed` with cancelled status; it
+does not report success or replay completed tools. Hosts must still reconcile
+external effects before resuming interrupted work.
+
 `JobStore.recover(transcript)` compares each saved call and result with the
 checkpoint. A returned job whose exact evidence is already present reconciles
 silently; the absence of an old display notice is not a recovery event. Missing
