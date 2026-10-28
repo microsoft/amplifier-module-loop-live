@@ -14,6 +14,7 @@ from contextvars import ContextVar
 
 from amplifier_core import HookResult
 from amplifier_module_loop_streaming import StreamingOrchestrator, ConversationProviderPin
+from amplifier_module_loop_streaming.suspension import ExecutionSuspended, ToolExecutionSuspended, ResumingTool
 from .runtime import Input, observation
 from .provenance import InputContext, ContinuationContext, input_metadata
 from .job_store import serialize_result
@@ -37,11 +38,47 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         self.root_provider = None
         self.approved_dispatch = ApprovedDispatch(self)
 
-    async def _execute_guarded_goal(self, prompt, context, providers, tools, hooks, coordinator):
+    @staticmethod
+    def _validate_suspended_envelope(envelope, ledger):
+        """Validate portable format and durable job ownership before restore."""
+        if not isinstance(envelope, dict) or type(envelope.get("version")) is not int or envelope["version"] != 1:
+            raise ValueError("Unsupported live suspension envelope version")
+        epoch = envelope.get("epoch")
+        if not isinstance(epoch, str) or not 1 <= len(epoch) <= 128:
+            raise ValueError("Invalid live suspension epoch")
+        jobs = envelope.get("jobs", [])
+        if not isinstance(jobs, list) or any(not isinstance(row, dict) for row in jobs):
+            raise ValueError("Invalid live suspension jobs")
+        paused = {}
+        for row in (ledger.rows.values() if ledger is not None else ()):
+            if row.get("status") == "paused":
+                identity = row.get("job_id")
+                if not isinstance(identity, str) or not identity or identity in paused:
+                    raise RuntimeError("Invalid paused ledger job identity")
+                paused[identity] = row
+        if jobs and ledger is None:
+            raise RuntimeError("Paused background jobs require a durable live.jobs ledger")
+        seen = set()
+        for job in jobs:
+            identity = job.get("job_id")
+            row = paused.get(identity) if isinstance(identity, str) else None
+            if (row is None or identity in seen or job.get("status") != "paused"
+                    or job.get("call_id") != row.get("call_id")
+                    or job.get("generation") != row.get("generation")
+                    or job.get("continuation") is None
+                    or job["continuation"] != row.get("continuation")):
+                raise RuntimeError("Suspended job does not match its durable ledger")
+            seen.add(identity)
+        if seen != set(paused):
+            raise RuntimeError("Suspension envelope omits a paused ledger job")
+
+    async def _execute_guarded_goal(self, prompt, context, providers, tools, hooks, coordinator, resume=None):
         # An explicit input always receives its first turn. Only automatic goal
         # continuations consult the host at the last safe admission boundary.
         token = _GOAL_SCOPE.set({"coordinator": coordinator, "turns": 0, "result": ""})
         try:
+            if resume is not None:
+                return await super().resume(resume, context, providers, tools, hooks, coordinator)
             return await super().execute(prompt, context, providers, tools, hooks, coordinator)
         finally:
             _GOAL_SCOPE.reset(token)
@@ -151,14 +188,35 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         if runtime is None:
             # CLI's production spawner expects a finite result from workers.
             try:
-                result=await self._execute_guarded_goal(prompt, context, providers, tools, hooks, coordinator)
+                result=await self._execute_guarded_goal(prompt, context, providers, tools, hooks, coordinator,
+                    resume=coordinator.get_capability("execution.restored") if coordinator else None)
                 self.host.finite_finished(finite_scope, coordinator, "completed", result)
                 return result
+            except ExecutionSuspended as paused:
+                # Native Core's execute ABI returns text and may translate all
+                # Python exceptions into execution errors. A host which owns
+                # the finite child can accept this explicit control outcome,
+                # rather than mistaking an exception string for proof of pause.
+                suspended = getattr(self.host, "finite_suspended", None)
+                if suspended:
+                    accepted = suspended(finite_scope, coordinator, paused.continuation)
+                    if __import__("inspect").isawaitable(accepted):
+                        accepted = await accepted
+                    if accepted is True:
+                        return ""
+                self.host.finite_finished(finite_scope, coordinator, "paused")
+                raise
             except BaseException as exc:
                 self.host.finite_finished(finite_scope, coordinator, "cancelled" if isinstance(exc,asyncio.CancelledError) else "error")
                 raise
         if self.running:
             raise RuntimeError("One execute owner per manager session")
+        ledger = coordinator.get_capability("live.jobs")
+        restored = coordinator.get_capability("live.suspended_execution")
+        if restored is not None:
+            self._validate_suspended_envelope(restored, ledger)
+        elif ledger is not None and any(row.get("status") == "paused" for row in ledger.rows.values()):
+            raise RuntimeError("Paused ledger jobs require their suspension envelope")
         self.running, self.runtime = True, runtime
         self.context, self.tools, self.hooks, self.coordinator = context, tools, hooks, coordinator
         from .jobs import AsyncTool, JobControl
@@ -171,7 +229,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             {"job_id": identity, "call_id": job["call_id"], "status": job.get("status", "pending"),
              "tool": (job.get("tool_call") or {}).get("name")}
             for identity, job in self.jobs.items() if job.get("result") is None])
-        ledger = coordinator.get_capability("live.jobs")
         if ledger:
             recovered = coordinator.get_capability("live.recovered_jobs") or []
             for row in ledger.rows.values():
@@ -183,6 +240,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         native = self._select_provider(providers)
         self.host.prepare_provider(native, coordinator)
         native = native if getattr(native, "native_bundle_live", False) else None
+        runtime.execution_suspension_support = native is None
         runtime.anchored_steering_mode = "unavailable" if native else "request_boundary"
         runtime.steering_wake = lambda: self.steer(_WAKE)
         coordinator.register_capability("live.steering", {"version": 1,
@@ -218,7 +276,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         unregister = [hooks.register(event, observe, name="live-manager-" + event)
                       for event in ("content_block:end", "llm:stream_block_delta", "tool:pre", "tool:post", "tool:error")]
 
-        async def turn(command, *, continuation=False):
+        async def turn(command, *, continuation=False, resume=None):
             activation = coordinator.get_capability("live.activation")
             activation_token = None
             owner_token = LIVE_OWNER.set(self)
@@ -226,9 +284,10 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             try:
                 if activation:
                     activation_token = activation.bind(command.activation)
-                await self._synchronize_job_results(context)
+                if resume is None:
+                    await self._synchronize_job_results(context)
                 turn_context = context
-                if continuation:
+                if continuation or resume is not None:
                     turn_context = ContinuationContext(context)
                 else:
                     await runtime.emit("input.delivered", input_id=command.id,
@@ -238,8 +297,11 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     turn_context = InputContext(turn_context, self._text(command), command)
                 stage = "manager_turn"
                 result = await self._execute_guarded_goal(
-                    "" if continuation else self._text(command), turn_context, providers, tools, hooks, coordinator)
+                    "" if continuation or resume is not None else self._text(command),
+                    turn_context, providers, tools, hooks, coordinator, resume=resume)
                 await runtime.inbox.put(("bundle_turn", (result, None)))
+            except ExecutionSuspended as paused:
+                await runtime.inbox.put(("bundle_suspended", (command, paused.continuation)))
             except asyncio.CancelledError:
                 # Cancellation can originate inside a provider, hook or host
                 # admission guard, without a Stop command in the live inbox.
@@ -255,6 +317,50 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     activation.reset(activation_token)
                 LIVE_OWNER.reset(owner_token)
 
+        def restored_input(row):
+            return Input(**{**row, "attachments": tuple(row.get("attachments", ()))})
+        if restored:
+            runtime.pause_epoch = restored["epoch"]
+            runtime.pause_origin = restored.get("pause_origin")
+            runtime.pause_terminal = restored.get("pause_terminal")
+            runtime.pause_jobs = restored.get("pause_jobs", {})
+            runtime.generation = restored.get("generation")
+            runtime.suspended = restored.get("turn")
+            self.pending.extend(restored_input(row) for row in restored.get("pending", []))
+            runtime.accepted.update({row["id"]: restored_input(row) for row in restored.get("accepted", [])})
+            runtime.pending_steering.extend(restored_input(row) for row in restored.get("steering", []))
+            runtime.steering_outcomes.update(restored.get("steering_outcomes", {}))
+            runtime.steering_closed = restored.get("steering_closed", False)
+            runtime.owned_jobs = {row["job_id"]: dict(row) for row in
+                [*restored.get("jobs", []), *runtime.pause_jobs.values()]}
+        self.pending_job_results = dict((restored or {}).get("pending_job_results", {}))
+
+        async def paused_checkpoint():
+            save = coordinator.get_capability("live.suspend")
+            if not callable(save):
+                raise RuntimeError("This host cannot preserve a live suspension")
+            def command_data(command):
+                return {key: value for key, value in vars(command).items() if key != "activation"}
+            envelope = {"version": 1, "epoch": runtime.pause_epoch,
+                        "pause_origin": runtime.pause_origin, "pause_terminal": runtime.pause_terminal,
+                        "pause_jobs": runtime.pause_jobs,
+                        "pending_job_results": {command.id: self.pending_job_results[command.id]
+                            for command in self.pending if command.id in self.pending_job_results},
+                        "generation": runtime.generation, "turn": runtime.suspended,
+                        "pending": [command_data(row) for row in self.pending],
+                        "accepted": [command_data(row) for row in runtime.accepted.values()],
+                        "steering": [command_data(row) for row in runtime.pending_steering],
+                        "steering_outcomes": runtime.steering_outcomes,
+                        "steering_closed": runtime.steering_closed,
+                        "jobs": [{"job_id": identity, "call_id": job["call_id"],
+                                  "status": job.get("status"), "continuation": job.get("continuation"),
+                                  "generation": job.get("generation")}
+                                 for identity, job in self.jobs.items() if job.get("result") is None]}
+            self._validate_suspended_envelope(envelope, ledger)
+            if await save(envelope) is not True:
+                raise RuntimeError("Live suspension checkpoint was not acknowledged")
+            return envelope
+
         try:
             await runtime.emit("session.ready", mode="configured_bundle", native=bool(native),
                 steering="native" if native else "request_boundary", async_tools="native" if native else "delegate_job_handles" if
@@ -267,17 +373,19 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             if prompt:
                 self.pending.append(Input("user", prompt))
             while True:
-                if active is None and self.pending:
+                if active is None and self.pending and not runtime.pause_epoch:
                     await self._hold_anchored("generation-ended")
-                if active is None and self.pending and runtime.inbox.empty():
+                if active is None and self.pending and runtime.inbox.empty() and not runtime.pause_epoch:
                     command = self.pending.popleft()
+                    origin = self.pending_job_results.pop(command.id, None)
                     # Publish busy state before scheduling: a host control can
                     # otherwise park after dequeue but before turn() first runs.
                     await runtime.emit("generation.started", generation_id=str(uuid.uuid4()),
-                                       initial_input_id=command.id, call_id=command.call_id)
+                                       initial_input_id=command.id, call_id=command.call_id,
+                                       **({"result_origin": origin} if origin else {}))
                     active = asyncio.create_task(turn(command))
                     idle = False
-                if active is None and not self.pending and not self._active_jobs() and runtime.inbox.empty() and not idle:
+                if active is None and not self.pending and not self._active_jobs() and runtime.inbox.empty() and not idle and not runtime.pause_epoch:
                     idle = True
                     await runtime.emit("session.idle", text=last)
                     # A host may relinquish its durable session writer here while
@@ -288,6 +396,12 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     park = coordinator.get_capability("live.park")
                     if park:
                         await park(activation=last_activation)
+                if (runtime.pause_epoch and active is None and not self._active_jobs()
+                        and runtime.inbox.empty() and not idle):
+                    await paused_checkpoint()
+                    await runtime.emit("session.suspended", epoch=runtime.pause_epoch,
+                                       generation_id=(runtime.generation or {}).get("id"))
+                    idle = True
                 event = await runtime.inbox.get()
                 kind, value = event
                 activation = coordinator.get_capability("live.activation")
@@ -298,6 +412,70 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     captured = getattr(event, "activation", None)
                     activation.bind(captured)
                     last_activation = captured
+                if kind == "maintenance_pause":
+                    idle = False
+                    continue
+                if kind == "maintenance_release":
+                    if value != runtime.pause_epoch or active is not None or self._active_jobs():
+                        await runtime.emit("maintenance.release_refused", epoch=value, reason="execution-not-settled")
+                        continue
+                    await paused_checkpoint()
+                    status = "paused"
+                    break
+                if kind == "maintenance_resume":
+                    admit = coordinator.get_capability("live.maintenance_admit")
+                    if (value != runtime.pause_epoch or not callable(admit)
+                            or runtime.stop_requested or coordinator.cancellation.is_cancelled
+                            or await admit(value) is not True
+                            or runtime.stop_requested or coordinator.cancellation.is_cancelled):
+                        await runtime.emit("maintenance.resume_refused", epoch=value)
+                        continue
+                    # The durable host admission is authoritative. A resumed
+                    # turn keeps its generation and original input identity.
+                    saved = runtime.suspended
+                    runtime.pause_epoch, runtime.suspended = None, None
+                    # Durable inputs never contain a process-local writer
+                    # token. Only the explicit, admitted continuation handoff
+                    # may bind their original identities to this acquisition.
+                    if activation:
+                        from dataclasses import replace
+                        self.pending = deque(replace(command, activation=activation.current())
+                                             for command in self.pending)
+                        runtime.pending_steering = deque(
+                            replace(command, activation=activation.current())
+                            for command in runtime.pending_steering)
+                    if saved:
+                        command = restored_input(saved["command"])
+                        if activation:
+                            command = __import__("dataclasses").replace(command, activation=activation.current())
+                        active = asyncio.create_task(turn(command, resume=saved["continuation"]))
+                    for job_id, job in self.jobs.items():
+                        if job.get("status") == "paused":
+                            from amplifier_core.message_models import ToolCall
+                            call = ToolCall(**job["tool_call"])
+                            continuation = job["continuation"]
+                            if ledger:
+                                ledger.resume_paused(call.id, continuation)
+                            job["status"] = "pending"
+                            job["task"] = asyncio.create_task(self._run_background_job(
+                                job_id, call, tools, hooks, job.get("parallel_group_id"),
+                                coordinator, continuation=continuation))
+                    idle = False
+                    await runtime.emit("session.resumed", epoch=value)
+                    continue
+                if kind == "bundle_suspended":
+                    await active
+                    command, frame = value
+                    active = None
+                    runtime.suspended = {"command": {key: item for key, item in vars(command).items()
+                                                     if key != "activation"}, "continuation": frame}
+                    idle = False
+                    continue
+                if kind == "bundle_job_suspended":
+                    if value in runtime.pause_jobs:
+                        runtime.pause_jobs[value]["status"] = "paused"
+                    idle = False
+                    continue
                 if kind == "input":
                     runtime.queued_inputs -= 1
                     if value.activation is not None:
@@ -352,7 +530,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     # never replay the previous prompt or completed tools.
                     pending = [command for command in [*self.pending, *runtime.pending_steering]
                                if command.target_generation_id == runtime.generation['id']]
-                    if (pending and not runtime.stop_requested
+                    if (pending and not runtime.pause_epoch and not runtime.stop_requested
                             and not coordinator.cancellation.is_cancelled and not self._budget_exhausted):
                         active = asyncio.create_task(turn(pending[0], continuation=True))
                         continue
@@ -395,7 +573,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             if active:
                 active.cancel()
                 await asyncio.gather(active, return_exceptions=True)
-            await self._hold_anchored("session-closing")
+            if status != "paused":
+                await self._hold_anchored("session-closing")
             if active:
                 await runtime.emit("generation.detached", cancellation="unconfirmed")
             for job in self.jobs.values():
@@ -429,7 +608,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             activation = coordinator.get_capability("live.activation")
             if checkpoint and (not activation or activation.current_valid):
                 try:
-                    await self._synchronize_job_results(context)
+                    if status != "paused":
+                        await self._synchronize_job_results(context)
                     await asyncio.wait_for(checkpoint(status), 2)
                 except Exception as exc:
                     await runtime.emit("persistence.failed", error_type=type(exc).__name__)
@@ -478,45 +658,65 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             from .scope import NATIVE_REQUEST
             provider = NATIVE_REQUEST.get()
             ledger.begin(tool_call, job_id, receipt,
-                         provider.async_calls.get(tool_call.id) if provider else None)
+                         provider.async_calls.get(tool_call.id) if provider else None,
+                         generation=runtime.generation, parallel_group_id=parallel_group_id)
 
-        async def work():
-            from .scope import JOB_CALL
-            job_token=JOB_CALL.set(tool_call.id)
-            # Isolate turn counters and ephemeral hook buffers from the manager.
-            # The original engine still runs tool:pre/approval, dispatch identity,
-            # cancellation tracking, tool:post and output modification.
-            executor = StreamingOrchestrator(self.config)
-            injections = ()
-            try:
-                job = self.jobs[job_id]
-                job["started"] = True
-                if job.get("cancel_requested"):
-                    raise asyncio.CancelledError
-                _, _, result = await executor._execute_tool_only(
-                    tool_call, tools, hooks, parallel_group_id, coordinator)
-                outcome, injections = "returned", executor._pending_ephemeral_injections
-            except asyncio.CancelledError:
-                result, outcome = None, "cancelled"
-            except Exception as exc:
-                result, outcome = type(exc).__name__, "failed"
-            finally:
-                JOB_CALL.reset(job_token)
-            # Commit after the normal tool post-hooks, before the inbox/event
-            # publication. A crash in that gap must preserve the actual report.
+
+        self.jobs[job_id] = {"task": asyncio.create_task(self._run_background_job(job_id, tool_call, tools, hooks, parallel_group_id, coordinator)), "call_id": tool_call.id,
+                             "tool_call": tool_call.model_dump(), "receipt": receipt, "status": "pending",
+                             "parallel_group_id": parallel_group_id,
+                             "generation": __import__("copy").deepcopy(runtime.generation)}
+        self._tool_calls_this_turn += 1
+        origin = self.jobs[job_id]["generation"] or {}
+        await runtime.emit("job.queued", job_id=job_id, call_id=tool_call.id, tool=tool_call.name,
+                           generation_id=origin.get("id"), input_ids=list(origin.get("input_ids", [])))
+        return tool_call.id, tool_call.name, self.jobs[job_id]["receipt"]
+
+    async def _run_background_job(self, job_id, tool_call, tools, hooks, parallel_group_id, coordinator, continuation=None):
+        runtime = self.runtime
+        ledger = coordinator.get_capability("live.jobs") if coordinator else None
+        from .scope import JOB_CALL
+        job_token=JOB_CALL.set(tool_call.id)
+        # Isolate turn counters and ephemeral hook buffers from the manager.
+        # The original engine still runs tool:pre/approval, dispatch identity,
+        # cancellation tracking, tool:post and output modification.
+        executor = StreamingOrchestrator(self.config)
+        injections = ()
+        try:
+            job = self.jobs[job_id]
+            job["started"] = True
+            if job.get("cancel_requested"):
+                raise asyncio.CancelledError
+            mounted = tools if continuation is None or continuation.get("kind") == "not_started" else {
+                **tools, tool_call.name: ResumingTool(tools.get(tool_call.name), continuation)}
+            _, _, result = await executor._execute_tool_only(
+                tool_call, mounted, hooks, parallel_group_id, coordinator)
+            outcome, injections = "returned", executor._pending_ephemeral_injections
+        except ToolExecutionSuspended as paused:
             try:
                 if ledger:
-                    ledger.finish(tool_call.id, result, outcome)
+                    ledger.suspend(tool_call.id, paused.continuation)
             except Exception as exc:
                 await runtime.inbox.put(("bundle_persistence_error", type(exc).__name__))
                 return
-            await runtime.inbox.put(("bundle_job", (job_id, result, outcome, injections)))
-
-        self.jobs[job_id] = {"task": asyncio.create_task(work()), "call_id": tool_call.id,
-                             "tool_call": tool_call.model_dump(), "receipt": receipt, "status": "pending"}
-        self._tool_calls_this_turn += 1
-        await runtime.emit("job.queued", job_id=job_id, call_id=tool_call.id, tool=tool_call.name)
-        return tool_call.id, tool_call.name, self.jobs[job_id]["receipt"]
+            job.update(status="paused", continuation=paused.continuation)
+            await runtime.inbox.put(("bundle_job_suspended", job_id))
+            return
+        except asyncio.CancelledError:
+            result, outcome = None, "cancelled"
+        except Exception as exc:
+            result, outcome = type(exc).__name__, "failed"
+        finally:
+            JOB_CALL.reset(job_token)
+        # Commit after the normal tool post-hooks, before the inbox/event
+        # publication. A crash in that gap must preserve the actual report.
+        try:
+            if ledger:
+                ledger.finish(tool_call.id, result, outcome)
+        except Exception as exc:
+            await runtime.inbox.put(("bundle_persistence_error", type(exc).__name__))
+            return
+        await runtime.inbox.put(("bundle_job", (job_id, result, outcome, injections)))
 
     async def _job_returned(self, job_id, result, outcome, injections=(), *, deliver):
         job = self.jobs[job_id]
@@ -528,9 +728,13 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         if deliver:
             self._pending_ephemeral_injections.extend(injections)
             activation = self.coordinator.get_capability("live.activation")
-            self.pending.append(Input("service", json.dumps({"job_id": job_id,
+            command = Input("service", json.dumps({"job_id": job_id,
                 "call_id": job["call_id"], "status": outcome, "tool_report": result}), source="amplifier-delegate",
-                activation=activation.current() if activation else None))
+                activation=activation.current() if activation else None)
+            self.pending.append(command)
+            self.pending_job_results[command.id] = {"jobId": job_id, "callId": job["call_id"]}
+            await self.runtime.emit("job.result_queued", input_id=command.id, job_id=job_id,
+                                    call_id=job["call_id"])
             self.steer(_WAKE)
 
 
