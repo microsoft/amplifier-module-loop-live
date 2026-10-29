@@ -41,7 +41,7 @@ async def test_pause_during_evaluator_prevents_stale_automatic_turn(monkeypatch)
 async def test_opt_in_guard_allows_normal_continuation(monkeypatch):
     loop = BundleLiveOrchestrator({'goal_stall_threshold': 100})
     guard = AsyncMock(return_value=True)
-    coordinator = SimpleNamespace(session_state={'goal': {'turns_used': 0, 'last_reason': None, 'condition': 'finish task', 'cap': 5}}, cancellation=SimpleNamespace(is_cancelled=False), get_capability=lambda name: guard)
+    coordinator = SimpleNamespace(session_state={'goal': {'turns_used': 0, 'last_reason': None, 'condition': 'finish task', 'cap': 5}}, cancellation=SimpleNamespace(is_cancelled=False), get_capability=lambda name: guard if name == 'live.continuation_guard' else None)
     actual_turn = AsyncMock(side_effect=['First response', 'Final response'])
     monkeypatch.setattr(StreamingOrchestrator, '_execute_one_turn', actual_turn)
     loop._evaluate_goal = AsyncMock(side_effect=[(False, 'Continue'), (True, 'Evidence verified')])
