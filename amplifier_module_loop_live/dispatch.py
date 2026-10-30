@@ -39,7 +39,7 @@ class CallScope:
 
 
 class GuardedTool:
-    """Serialize actual execution, after the engine has processed approvals."""
+    """Keep default ordering; tool-owned independent reads may overlap."""
 
     def __init__(self, tool, lock, observation=None, authority=None):
         self.tool, self.lock, self.observation = tool, lock, observation
@@ -49,15 +49,21 @@ class GuardedTool:
         return getattr(self.tool, name)
 
     async def execute(self, arguments):
+        concurrent = getattr(self.tool, 'allows_concurrent_execution', None)
+        if callable(concurrent) and concurrent(arguments) is True:
+            return await self._execute(arguments)
         async with self.lock:
-            if self.authority:
-                self.authority()
-            if self.observation is not None:
-                self.observation["started"] = True
-            result = await self.tool.execute(arguments)
-            if self.observation is not None:
-                self.observation["raw_success"] = getattr(result, "success", None)
-            return result
+            return await self._execute(arguments)
+
+    async def _execute(self, arguments):
+        if self.authority:
+            self.authority()
+        if self.observation is not None:
+            self.observation["started"] = True
+        result = await self.tool.execute(arguments)
+        if self.observation is not None:
+            self.observation["raw_success"] = getattr(result, "success", None)
+        return result
 
 
 class AttributedHooks:
