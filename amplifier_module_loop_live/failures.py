@@ -58,7 +58,8 @@ def turn_failure(error, stage="manager_turn"):
                   "native_measurement_unavailable", "native_compaction_failed",
                   "disabled", "request_context_unavailable", "invalid_native_contract",
                   "authoritative_measurement_unavailable", "summary_output_limit", "summary_empty",
-                  "previous_failure", "summary_failed", "native_failed"}
+                  "previous_failure", "summary_failed", "native_failed",
+                  "native_recovery_required_context_oversized", "checkpoint_persist_failed"}
     count_failure = count_diagnostic(error)
     if count_failure is not None:
         category, stage = 'context_measurement', 'context_preparation'

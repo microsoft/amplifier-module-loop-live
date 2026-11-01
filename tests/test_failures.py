@@ -60,6 +60,7 @@ async def test_local_failure_keeps_cause_and_identity_without_provider_error_or_
 
 
 @pytest.mark.parametrize('code', ['native_input_oversized', 'summary_output_limit', 'summary_empty',
+    'native_recovery_required_context_oversized', 'checkpoint_persist_failed',
     'previous_failure', 'summary_failed', 'native_failed', 'private payload', {'secret': 'value'}])
 def test_compaction_failure_preserves_bounded_code_without_optional_dependency(code):
     error_class = type('CompactionError', (RuntimeError,), {
