@@ -112,7 +112,40 @@ Core tests run without the CLI adapter or any provider package. They exercise
 finite execution, dynamic prompts, queued steering, background delegation with
 approval hooks, input identity/backpressure, and interruption recovery. The
 optional adapter and application integration are tested separately by Amplifier
-Converge's runtime suite. The job ledger currently requires macOS or Linux.
+Converge's runtime suite.
+
+### Job ledger storage boundary
+
+`JobStore` uses a stable `owner.lock`: nonblocking `flock` on macOS/Linux and a
+retained, nonblocking byte-zero CRT lock on Windows. Close or process exit releases
+ownership. The lock file is never truncated, replaced or unlinked. Saved records
+are explicitly UTF-8. Pending work after process loss remains uncertain and is
+never automatically replayed.
+
+The host must supply a trusted private storage location. On POSIX, new directories
+and files request modes `0700` and `0600`; existing storage is not repaired. On
+Windows, these mode bits do **not** supply private ACLs. The host must establish
+the private directory and safe inheritance **before** constructing `JobStore` or
+writing any payload. `JobStore` does not validate or repair Windows ACLs and is
+not a security boundary against an untrusted writer with access to its directory.
+
+Each update writes and flushes a same-directory temporary file before atomic
+replacement. POSIX retains file `fsync`, `os.replace`, and directory `fsync`.
+Windows uses file `fsync` and `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`,
+without cross-volume copy or an `O_DIRECTORY` emulation. These request OS flushing;
+Windows directory-metadata durability and arbitrary filesystem/hardware power-loss
+behavior are not qualified. A refused Windows replacement retains the old file
+and in-memory row, raises its Windows error, and cleans up the owned temporary
+file; it is not retried. If cleanup also fails, the original error is retained
+with a cleanup note. POSIX directory-flush failure can occur after replacement:
+that is an uncertain committed state, not permission to repeat a dispatch.
+
+The focused `windows-job-ledger` CI job targets ordinary CPython 3.13 x64 with a
+non-editable wheel outside the checkout and binary Core 2.0.2. It requires native
+import, contention, close/crash/termination release, Unicode recovery, and refused
+replacement checks without skips. Source/model tests on POSIX are not native
+Windows acceptance; this lane does not qualify application integration, ACL
+provisioning, a live provider, network storage or power-loss recovery.
 
 See [provenance](PROVENANCE.md) for the extraction boundary and upstream dependencies.
 

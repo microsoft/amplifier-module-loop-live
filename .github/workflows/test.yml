@@ -34,6 +34,105 @@ jobs:
             'amplifier-core @ git+https://github.com/microsoft/amplifier-core@main'
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/loop-live-smoke/bin/python" -I -c 'from amplifier_module_loop_live import mount; from amplifier_module_loop_live.runtime import Runtime, Input; import sys; assert not any(name.startswith(("amplifier_app_cli", "amplifier_loop_live_cli", "amplifier_live", "amplifier_web")) for name in sys.modules)'
+  windows-job-ledger:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      PYTHONUTF8: '0'
+      UV_PYTHON_DOWNLOADS: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - name: Build and install the non-editable candidate with binary Core
+        shell: pwsh
+        run: |
+          uv build --wheel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $envRoot = Join-Path $env:RUNNER_TEMP 'loop-live-ledger-env'
+          $basePythonOutput = @(python -I -S -B -c "import sys; print(sys.executable)")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($basePythonOutput.Count -ne 1 -or $basePythonOutput[0] -isnot [string]) {
+            throw 'Expected one executing Python path'
+          }
+          $basePython = $basePythonOutput[0]
+          if (-not [IO.Path]::IsPathFullyQualified($basePython) -or
+              -not (Test-Path -LiteralPath $basePython -PathType Leaf)) {
+            throw 'Executing Python path must be absolute and an existing file'
+          }
+          & $basePython -I -S -B -c "import os, struct, sys, sysconfig; assert os.name == 'nt' and sys.implementation.name == 'cpython'; assert sys.version_info[:2] == (3, 13) and struct.calcsize('P') == 8; assert not sysconfig.get_config_var('Py_GIL_DISABLED'); assert sys.prefix == sys.base_prefix"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv venv --python $basePython $envRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $python = Join-Path $envRoot 'Scripts/python.exe'
+          $wheels = @(Get-ChildItem dist/*.whl)
+          if ($wheels.Count -ne 1) { throw 'Expected exactly one candidate wheel' }
+          $wheel = $wheels[0].FullName
+          uv pip install --python $python --only-binary amplifier-core `
+            'amplifier-core==2.0.2' pytest $wheel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Require installed origin and actual native ledger checks without skips
+        shell: pwsh
+        run: |
+          $python = Join-Path $env:RUNNER_TEMP 'loop-live-ledger-env/Scripts/python.exe'
+          $checks = Join-Path $env:RUNNER_TEMP 'loop-live-ledger-checks'
+          New-Item -ItemType Directory $checks -ErrorAction Stop | Out-Null
+          Copy-Item tests/test_job_store.py (Join-Path $checks 'test_job_store.py')
+          Set-Location $checks
+          @'
+          import importlib.metadata as metadata
+          import codecs, io, json, locale, os, struct, sys, sysconfig
+          from pathlib import Path
+          import amplifier_module_loop_live
+          from amplifier_module_loop_live import job_store
+          assert os.name == "nt" and sys.implementation.name == "cpython"
+          assert sys.version_info[:2] == (3, 13) and struct.calcsize("P") == 8
+          assert not sysconfig.get_config_var("Py_GIL_DISABLED")
+          assert sys.flags.utf8_mode == 0, "Non-UTF-8 qualification requires -X utf8=0"
+          for encoding in (locale.getencoding(), locale.getpreferredencoding(False),
+                           io.TextIOWrapper(io.BytesIO()).encoding):
+              assert codecs.lookup(encoding).name == "cp1252", (
+                  f"Cannot qualify non-UTF-8 Windows ledger with default encoding {encoding}")
+          print("Legacy locale qualification: UTF-8 mode disabled; locale and default text encoding CP1252")
+          assert metadata.version("amplifier-core") == "2.0.2"
+          assert job_store._WINDOWS and "fcntl" not in sys.modules
+          site = (Path(sys.prefix) / "Lib" / "site-packages").resolve()
+          for module in (amplifier_module_loop_live, job_store):
+              assert Path(module.__file__).resolve().is_relative_to(site)
+          dist = metadata.distribution("amplifier-module-loop-live")
+          direct = json.loads(dist.read_text("direct_url.json"))
+          assert direct["url"].endswith(".whl") and "archive_info" in direct
+          assert not direct.get("dir_info", {}).get("editable", False)
+          source = Path(os.environ["GITHUB_WORKSPACE"]) / "amplifier_module_loop_live" / "job_store.py"
+          assert Path(job_store.__file__).read_bytes() == source.read_bytes()
+          assert not any(name.startswith(("amplifier_web", "amplifier_app_cli", "amplifier_loop_live_cli"))
+                         for name in sys.modules)
+          '@ | & $python -I -X utf8=0 -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python -I -X utf8=0 -m pytest -v --junitxml=ledger.xml test_job_store.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse("ledger.xml").getroot().findall(".//testcase")
+          required = {
+              "test_native_windows_import_without_fcntl",
+              "test_native_windows_byte_zero_lock_on_empty_stable_file",
+              "test_native_windows_refused_replacement_keeps_old_bytes_memory_and_error",
+              "test_stable_lock_rejects_competing_process_and_preserves_existing_bytes",
+              "test_owner_close_crash_and_termination_release_without_replay",
+              "test_utf8_begin_finish_and_recovery_preserve_identity_and_service_provenance",
+              "test_publication_failure_preserves_old_bytes_and_memory_without_retry",
+              "test_process_death_after_result_commit_recovers_call_without_checkpoint_or_reexecution",
+          }
+          assert required <= {case.attrib["name"] for case in cases}
+          assert cases and all(not any(case.find(tag) is not None for tag in ("skipped", "failure", "error"))
+                               for case in cases)
+          '@ | & $python -I -X utf8=0 -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   native-adapter:
     runs-on: ubuntu-latest
     steps:
