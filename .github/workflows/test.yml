@@ -54,7 +54,18 @@ jobs:
           uv build --wheel
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $envRoot = Join-Path $env:RUNNER_TEMP 'loop-live-ledger-env'
-          $basePython = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+          $basePythonOutput = @(python -I -S -B -c "import sys; print(sys.executable)")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($basePythonOutput.Count -ne 1 -or $basePythonOutput[0] -isnot [string]) {
+            throw 'Expected one executing Python path'
+          }
+          $basePython = $basePythonOutput[0]
+          if (-not [IO.Path]::IsPathFullyQualified($basePython) -or
+              -not (Test-Path -LiteralPath $basePython -PathType Leaf)) {
+            throw 'Executing Python path must be absolute and an existing file'
+          }
+          & $basePython -I -S -B -c "import os, struct, sys, sysconfig; assert os.name == 'nt' and sys.implementation.name == 'cpython'; assert sys.version_info[:2] == (3, 13) and struct.calcsize('P') == 8; assert not sysconfig.get_config_var('Py_GIL_DISABLED'); assert sys.prefix == sys.base_prefix"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv venv --python $basePython $envRoot
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $python = Join-Path $envRoot 'Scripts/python.exe'
