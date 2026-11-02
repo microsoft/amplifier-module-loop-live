@@ -66,3 +66,10 @@ disappeared; hosts must signal their real cancellation token or cancel the owned
 orchestrator task. Finite `coordinator.request_cancel(immediate=True)` and live
 runtime `Input("stop", target="cancel")` are the supported paths verified by the
 local cross-module fixture. Graceful cancellation retains existing semantics.
+
+Live retains a small compatibility adapter for its tool-declared independent-read
+concurrency policy. It changes only the serialization context: the shared
+Streaming guard still performs the authority check and records execution and
+result observations. Lease lifetime, caller allowlists, nested inference budgets,
+suspension and unknown-effect recovery remain owned by Streaming. Nested holds
+are non-retryable; never replay the enclosing controller to recover them.
