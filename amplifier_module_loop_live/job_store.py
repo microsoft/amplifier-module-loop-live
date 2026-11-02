@@ -18,6 +18,77 @@ def serialize_result(result, outcome):
         "status": outcome, "tool_report": result, "effects": "not_rolled_back"})
 
 
+class _RecoveryEvidence:
+    """One recovery's lookups over its detached transcript, never authority.
+
+    Keep every output (including duplicates) for the ordinary conflict checks.
+    Calls missing before an existing output are inserted in one final pass so
+    repairing many missing calls does not repeatedly shift/scan the history.
+    """
+
+    def __init__(self):
+        self.calls = set()
+        self.outputs = {}
+        self.notices = set()
+        self.before = {}
+
+    @classmethod
+    def build(cls, transcript, jobs):
+        # The normal persisted shape is plain JSON. Preserve the original
+        # lookup/evaluation semantics for malformed or custom caller objects.
+        if type(transcript) is not list or any(
+            type(row) is not dict or type(row.get("job_id")) is not str
+            or type(row.get("tool_call")) is not dict
+            or (row["tool_call"].get("id") is not None and type(row["tool_call"]["id"]) is not str)
+            for row in jobs
+        ):
+            return None
+        result = cls()
+        for position, message in enumerate(transcript):
+            if type(message) is not dict:
+                return None
+            role = message.get("role")
+            if type(role) is not str:
+                return None
+            if role == "assistant":
+                calls = message.get("tool_calls") or []
+                content = message.get("content")
+                if type(calls) is not list or any(type(call) is not dict for call in calls):
+                    return None
+                if isinstance(content, list):
+                    if type(content) is not list or any(type(part) is not dict for part in content):
+                        return None
+                    calls = calls + [part for part in content if part.get("type") == "tool_call"]
+                for call in calls:
+                    identity = call.get("id")
+                    if identity is not None and type(identity) is not str:
+                        return None
+                    result.calls.add(identity)
+            if role == "tool":
+                identity = message.get("tool_call_id")
+                if identity is not None and type(identity) is not str:
+                    return None
+                result.outputs.setdefault(identity, []).append((position, message))
+            metadata = message.get("metadata") or {}
+            if type(metadata) is not dict:
+                return None
+            notice = metadata.get("live_recovery_job")
+            if notice is not None and type(notice) is not str:
+                return None
+            result.notices.add(notice)
+        return result
+
+    def insert_calls(self, transcript):
+        if not self.before:
+            return transcript
+        result = []
+        for position, message in enumerate(transcript):
+            if position in self.before:
+                result.append(self.before[position])
+            result.append(message)
+        return result
+
+
 class JobStore:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -88,6 +159,7 @@ class JobStore:
         uncertainty, but never authorizes skipping missing/conflicting evidence.
         """
         transcript = copy.deepcopy(transcript)
+        evidence = _RecoveryEvidence.build(transcript, self.rows.values()) if self.rows else None
         recovered = []
         for identity, original in list(self.rows.items()):
             row = original
@@ -99,19 +171,32 @@ class JobStore:
                     "instruction": "The prior process ended without a saved result. Inspect actual state before deciding whether to repeat work."})}
                 self._write(row)
                 changed = True
-            present = any(m.get("role") == "assistant" and (
+            present = identity in evidence.calls if evidence is not None else any(m.get("role") == "assistant" and (
                 any(c.get("id") == identity for c in m.get("tool_calls") or []) or
                 (isinstance(m.get("content"), list) and any(c.get("type") == "tool_call" and
                  c.get("id") == identity for c in m["content"]))) for m in transcript)
             if not present:
                 call = row["tool_call"]
-                position = next((i for i, m in enumerate(transcript) if m.get("role") == "tool"
-                                 and m.get("tool_call_id") == identity), len(transcript))
-                transcript.insert(position, {"role": "assistant", "content": [{"type": "tool_call", "id": identity,
+                restored_call = {"role": "assistant", "content": [{"type": "tool_call", "id": identity,
                     "name": call["name"], "input": call["arguments"]}], "tool_calls": [call],
                     "metadata": {"converge_recovered_job": row["job_id"],
-                        "converge_native_async_calls": [row["native_call"]] if row.get("native_call") else []}})
-            outputs = [m for m in transcript if m.get("role") == "tool" and m.get("tool_call_id") == identity]
+                        "converge_native_async_calls": [row["native_call"]] if row.get("native_call") else []}}
+                if evidence is not None:
+                    # Restored content and the retained call record are both
+                    # visible to later jobs, even in a malformed old ledger
+                    # whose stored call ID differs from its ledger identity.
+                    evidence.calls.update((identity, call.get("id")))
+                    existing = evidence.outputs.get(identity)
+                    if existing:
+                        evidence.before[existing[0][0]] = restored_call
+                    else:
+                        transcript.append(restored_call)
+                else:
+                    position = next((i for i, m in enumerate(transcript) if m.get("role") == "tool"
+                                     and m.get("tool_call_id") == identity), len(transcript))
+                    transcript.insert(position, restored_call)
+            outputs = ([message for _, message in evidence.outputs.get(identity, [])] if evidence is not None
+                       else [m for m in transcript if m.get("role") == "tool" and m.get("tool_call_id") == identity])
             for output in outputs:
                 # Only replace this host's exact receipt or our saved result.
                 # A conflicting checkpoint needs inspection, not an overwrite.
@@ -123,7 +208,8 @@ class JobStore:
                 transcript.append({"role": "tool", "tool_call_id": identity,
                                    "name": row["tool_call"]["name"], "content": row["result"]})
             restored = not present or not outputs
-            known = any((m.get("metadata") or {}).get("live_recovery_job") == row["job_id"] for m in transcript)
+            known = (row["job_id"] in evidence.notices if evidence is not None else
+                     any((m.get("metadata") or {}).get("live_recovery_job") == row["job_id"] for m in transcript))
             # Keep notification identity in the private job ledger so dropping
             # a notice during compaction does not announce the same uncertainty
             # again. This is NOT a checkpoint acknowledgment: the actual call
@@ -149,8 +235,10 @@ class JobStore:
                         "metadata": {"live_recovery_job": row["job_id"], "recovery": recovery,
                             **input_metadata(Input(kind="service", id=row["job_id"],
                                 source="local-job-recovery", call_id=identity))}})
+                    if evidence is not None:
+                        evidence.notices.add(row["job_id"])
                 recovered.append(row)
                 notified = True
             if notified and row.get("recovery_notice") != fingerprint:
                 self._write({**row, "recovery_notice": fingerprint})
-        return transcript, recovered
+        return (evidence.insert_calls(transcript) if evidence is not None else transcript), recovered

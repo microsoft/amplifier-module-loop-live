@@ -405,6 +405,14 @@ class BundleTests(unittest.IsolatedAsyncioTestCase):
         self.tool.release.set()
         request = await self.provider.request()
         self.assertIn("MODIFIED-REPORT", str(request.messages))
+        returned = [event for event in self.runtime.events if event["type"] == "input.delivered"
+                    and event.get("source") == "amplifier-delegate"]
+        self.assertEqual(len(returned), 1)
+        self.assertEqual(returned[0]["call_id"], "worker-call")
+        messages = await self.session.coordinator.get("context").get_messages()
+        retained = next(message["metadata"]["amplifier_input"] for message in messages
+                        if message.get("metadata", {}).get("amplifier_input", {}).get("id") == returned[0]["input_id"])
+        self.assertEqual(retained["call_id"], "worker-call")
         self.assertIn(("tool:pre", "worker-call"), seen)
         self.assertIn(("tool:post", "worker-call"), seen)
         await self.provider.reply("worker reported")

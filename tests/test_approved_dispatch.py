@@ -143,8 +143,10 @@ async def test_nested_uses_standard_hooks_once_and_keeps_identity(environment):
         await client.lease.call("read", {})
 
 
-async def test_hook_denial_never_executes_nested_tool(environment):
+@pytest.mark.parametrize('independent', [False, True])
+async def test_hook_denial_never_executes_nested_tool(environment, independent):
     _, coordinator, _, echo = environment
+    echo.allows_concurrent_execution = lambda args: independent
 
     async def deny(event, data):
         return (
@@ -237,8 +239,10 @@ async def test_lease_cannot_cross_run_session_or_parent_scope(environment):
     assert echo.calls == 0
 
 
-async def test_nested_cancellation_emits_unknown_outcome_with_identity(environment):
+@pytest.mark.parametrize('independent', [False, True])
+async def test_nested_cancellation_emits_unknown_outcome_with_identity(environment, independent):
     _, coordinator, _, echo = environment
+    echo.allows_concurrent_execution = lambda args: independent
     echo.release = asyncio.Event()
     seen = []
 
@@ -310,6 +314,44 @@ async def test_same_tool_executes_serially_in_parallel_nested_calls(environment)
     assert echo.peak == 1
 
 
+async def test_declared_independent_reads_overlap_through_real_engine(environment):
+    _, coordinator, _, echo = environment
+    both = asyncio.Event()
+    original = echo.execute
+    async def read(arguments):
+        if echo.calls == 1:
+            both.set()
+        return await original(arguments)
+    echo.execute = read
+    echo.allows_concurrent_execution = lambda args: args.get('independent') is True
+    echo.release = asyncio.Event()
+    await coordinator.mount('tools', echo, name='alias')
+    async def program(lease):
+        tasks = [asyncio.create_task(lease.call(name, {'independent': True})) for name in ('read', 'alias')]
+        try:
+            await asyncio.wait_for(both.wait(), 1)
+            assert echo.active == 2
+        finally:
+            echo.release.set()
+            results = await asyncio.gather(*tasks)
+        return results
+    result, _ = await call_client(environment, Client(coordinator, program))
+    assert echo.peak == 2 and all(row['success'] for row in result)
+    assert len({row['source']['tool_call_id'] for row in result}) == 2
+
+
+async def test_declared_read_still_checks_authority_before_execution(environment):
+    from amplifier_module_loop_live.dispatch import GuardedTool
+    _, _, _, echo = environment
+    echo.allows_concurrent_execution = lambda args: True
+    def revoked():
+        raise RuntimeError('fixture revoked')
+    wrapped = GuardedTool(echo, asyncio.Lock(), authority=revoked)
+    with pytest.raises(RuntimeError, match='revoked'):
+        await wrapped.execute({})
+    assert echo.calls == 0
+
+
 async def test_ordinary_tool_is_invoked_exactly_once(environment):
     _, coordinator, loop, echo = environment
     with loop.approved_dispatch.run_scope(coordinator):
@@ -359,8 +401,10 @@ async def test_real_finite_session_enters_and_expires_lease_scope(environment):
         await client.lease.call("read", {})
 
 
-async def test_revoked_lease_cannot_execute_after_delayed_approval(environment):
+@pytest.mark.parametrize('independent', [False, True])
+async def test_revoked_lease_cannot_execute_after_delayed_approval(environment, independent):
     _, coordinator, loop, echo = environment
+    echo.allows_concurrent_execution = lambda args: independent
     approval = coordinator._test_approval
     approval.release = asyncio.Event()
     approval.answer = "allow"

@@ -42,6 +42,17 @@ allowlist retain their ordinary concurrency, since nested programs cannot call t
 tools can execute concurrently. There is no global lock spanning approval prompts.
 The dispatcher does not create additional ordinary tool invocations.
 
+A mounted tool may declare synchronous `allows_concurrent_execution(arguments)`.
+An exact `True` lets that invocation run without the adapter's per-tool lock.
+The tool owner must only declare operations safe to overlap with both other
+reads and serialized calls, and retain domain-specific consistency at its owner.
+Unknown operations and tools without the declaration keep existing serialization.
+This is a module implementation declaration, not a model argument or permission:
+the ordinary engine hooks/approvals, lease checks immediately before execution,
+call attribution, cancellation and post-hook results all remain unchanged.
+Aliases share the same declaration and default execution lock. Two undeclared
+operations still serialize even while declared reads are active.
+
 Tests exercise the real coordinator and ordinary tool engine, including a complete
 finite fixture-provider session. These are contract/fixture tests, not live model
 or application UI acceptance. No bundle composition is changed here.
@@ -55,3 +66,10 @@ disappeared; hosts must signal their real cancellation token or cancel the owned
 orchestrator task. Finite `coordinator.request_cancel(immediate=True)` and live
 runtime `Input("stop", target="cancel")` are the supported paths verified by the
 local cross-module fixture. Graceful cancellation retains existing semantics.
+
+Live retains a small compatibility adapter for its tool-declared independent-read
+concurrency policy. It changes only the serialization context: the shared
+Streaming guard still performs the authority check and records execution and
+result observations. Lease lifetime, caller allowlists, nested inference budgets,
+suspension and unknown-effect recovery remain owned by Streaming. Nested holds
+are non-retryable; never replay the enclosing controller to recover them.

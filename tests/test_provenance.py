@@ -24,10 +24,12 @@ async def test_boundary_steering_retains_service_provenance_and_user_quotes():
     assert context.messages[0]['content']==context.messages[1]['content']
     assert context.messages[0]['metadata']['amplifier_input']=={'version':1,'kind':'service','id':'observation','source':'amplifier-delegate','call_id':'call'}
     assert context.messages[1]['metadata']['amplifier_input']['kind']=='user'
+    delivered=[event for event in loop.runtime.events if event['type']=='input.delivered']
+    assert [(event['input_id'],event['call_id']) for event in delivered]==[('observation','call'),('user-quote',None)]
 
 async def test_new_turn_uses_tagged_context_before_engine_writes(monkeypatch):
     runtime=Runtime();context=Context();saved=asyncio.Event()
-    command=Input('service','Worker completed',source='amplifier-delegate',id='new-turn')
+    command=Input('service','Worker completed',source='amplifier-delegate',id='new-turn',call_id='returned-call')
     async def finite(self,prompt,ctx,*args):
         await ctx.add_message({'role':'user','content':prompt,'metadata':{'existing':'kept'}})
         saved.set();return 'done'
@@ -44,6 +46,8 @@ async def test_new_turn_uses_tagged_context_before_engine_writes(monkeypatch):
     assert row['role']=='user' and row['content']==loop._text(command)
     assert row['metadata']['existing']=='kept'
     assert row['metadata']['amplifier_input']['id']=='new-turn'
+    assert row['metadata']['amplifier_input']['call_id']=='returned-call'
+    assert next(event for event in runtime.events if event['type']=='input.delivered')['call_id']=='returned-call'
 
 async def test_prompt_wrapper_tags_only_one_matching_row_and_keeps_attachments():
     context=Context();command=Input('user','caption',id='upload')

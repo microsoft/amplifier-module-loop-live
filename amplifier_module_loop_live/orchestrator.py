@@ -20,6 +20,7 @@ from .job_store import serialize_result
 from .host import HostAdapter, AttachmentContext
 from .scope import HOST_ADAPTER
 from .failures import ManagerTurnError, turn_failure
+from .dispatch import ApprovedDispatch
 
 _WAKE = "[loop-live inbox wake]"
 _GOAL_SCOPE = ContextVar("live_goal_scope", default=None)
@@ -28,6 +29,9 @@ _GOAL_SCOPE = ContextVar("live_goal_scope", default=None)
 class BundleLiveOrchestrator(StreamingOrchestrator):
     def __init__(self, config=None):
         super().__init__(config)
+        # This is the shared dispatcher with only Live's read-concurrency policy.
+        # Keep the engine owner identical so scopes, budgets and resume stay active.
+        self.approved_dispatch = self._streaming_dispatch = ApprovedDispatch(self)
         self.runtime = None
         self.pending = deque()
         self.jobs = {}
@@ -101,7 +105,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             content = self.host.content(command, self.coordinator) if command.attachments else self._text(command)
             await context.add_message({"role": "user", "content": content, "metadata": input_metadata(command)})
             await self.runtime.emit("input.delivered", input_id=command.id,
-                                    delivery="request_boundary", source=command.source,
+                                    delivery="request_boundary", source=command.source, call_id=command.call_id,
                                     **({"target_generation_id": command.target_generation_id} if command.target_generation_id else {}))
             if command.target_generation_id is not None:
                 await self.runtime.emit("steering.applied", input_id=command.id,
@@ -236,7 +240,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     turn_context = ContinuationContext(context)
                 else:
                     await runtime.emit("input.delivered", input_id=command.id,
-                                       delivery="new_turn", source=command.source)
+                                       delivery="new_turn", source=command.source, call_id=command.call_id)
                     if command.attachments:
                         turn_context = AttachmentContext(context, self._text(command), self.host.content(command, coordinator))
                     turn_context = InputContext(turn_context, self._text(command), command)
@@ -526,7 +530,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             self._pending_ephemeral_injections.extend(injections)
             activation = self.coordinator.get_capability("live.activation")
             self.pending.append(Input("service", json.dumps({"job_id": job_id,
-                "call_id": job["call_id"], "status": outcome, "tool_report": result}), source="amplifier-delegate",
+                "call_id": job["call_id"], "status": outcome, "tool_report": result}), source="amplifier-delegate", call_id=job["call_id"],
                 activation=activation.current() if activation else None))
             self.steer(_WAKE)
 
