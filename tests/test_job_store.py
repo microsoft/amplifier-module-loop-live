@@ -1,3 +1,5 @@
+import ast
+import builtins
 import codecs
 import copy
 import ctypes
@@ -322,6 +324,49 @@ owner.close()
 
 
 class PlatformContractModels(unittest.TestCase):
+    def test_missing_fcntl_guard_allows_stdlib_probe_but_rejects_unconditional_ledger_import(self):
+        method = NativeWindowsLedgerTests.test_native_windows_import_without_fcntl
+        fixture = ast.parse("class NativeFixture:\n" + inspect.getsource(method))
+        code = next(node.value.value for node in ast.walk(fixture)
+                    if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                    and any(isinstance(target, ast.Name) and target.id == "code" for target in node.targets))
+        guard = next(node for node in ast.parse(code).body
+                     if isinstance(node, ast.FunctionDef) and node.name == "guarded")
+        namespace = {"original": builtins.__import__}
+        exec(compile(ast.Module(body=[guard], type_ignores=[]), "<native-import-guard>", "exec"), namespace)
+        guarded = namespace["guarded"]
+        guarded_builtins = {**vars(builtins), "__import__": guarded}
+        # Exercise the actual stdlib optional-import body without replacing
+        # subprocess or the candidate module with a successful test double.
+        probe = next(node for node in ast.walk(ast.parse(inspect.getsource(subprocess)))
+                     if isinstance(node, ast.Try) and any(
+                         isinstance(part, ast.Import) and any(alias.name == "fcntl" for alias in part.names)
+                         for part in node.body))
+        self.assertTrue(any(isinstance(handler.type, ast.Name) and handler.type.id == "ImportError"
+                            for handler in probe.handlers))
+        probe_code = compile(ast.Module(body=[probe], type_ignores=[]), "<stdlib-fcntl-probe>", "exec")
+        exec(probe_code, {"__builtins__": guarded_builtins})
+        # The old fixture's AssertionError escapes that legitimate ImportError
+        # handler, reproducing the native failure rather than accepting it.
+        old_guard = copy.deepcopy(guard)
+        old_guard.body[0].body[0] = ast.parse('raise AssertionError("Unix-only import")').body[0]
+        ast.fix_missing_locations(old_guard)
+        old_namespace = {"original": builtins.__import__}
+        exec(compile(ast.Module(body=[old_guard], type_ignores=[]), "<old-native-import-guard>", "exec"),
+             old_namespace)
+        with self.assertRaisesRegex(AssertionError, "Unix-only import"):
+            exec(probe_code, {"__builtins__": {**vars(builtins), "__import__": old_namespace["guarded"]}})
+        source = Path(job_store.__file__).read_text(encoding="utf-8")
+        with mock.patch.dict(sys.modules, {"os": SimpleNamespace(name="nt"), "msvcrt": SimpleNamespace()}):
+            with self.assertRaises(ModuleNotFoundError) as caught:
+                exec(compile("import fcntl\n" + source, "<unconditional-ledger-import>", "exec"),
+                     {"__builtins__": guarded_builtins})
+            self.assertEqual(caught.exception.name, "fcntl")
+            repaired = {"__builtins__": guarded_builtins}
+            exec(compile(source, job_store.__file__, "exec"), repaired)
+        self.assertTrue(repaired["_WINDOWS"])
+        self.assertTrue(callable(repaired["JobStore"]))
+
     def test_held_lock_model_rejects_original_body_and_accepts_size_check(self):
         method = LedgerPortabilityTests.test_stable_lock_rejects_competing_process_and_preserves_existing_bytes
         source = "class OriginalHeldLockBody:\n" + inspect.getsource(method)
@@ -493,7 +538,7 @@ import builtins, sys
 original = builtins.__import__
 def guarded(name, *args, **kwargs):
     if name == "fcntl":
-        raise AssertionError("Unix-only import")
+        raise ModuleNotFoundError("No module named 'fcntl'", name="fcntl")
     return original(name, *args, **kwargs)
 builtins.__import__ = guarded
 from amplifier_module_loop_live import mount
