@@ -2,15 +2,59 @@
 
 This recovers evidence, not running tasks. A pending dispatch after process loss
 has an unknown outcome and is never automatically re-executed.
+
+The host must supply trusted private storage, including inherited Windows ACLs.
+Windows mode bits do not establish that boundary. Publication is atomic with
+OS-requested flushing, not a guarantee against power loss on every filesystem.
 """
 
 import copy
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
+
+_WINDOWS = os.name == "nt"
+if _WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
+
+def _lock_owner(fd):
+    if _WINDOWS:
+        # Lock byte zero, including on a new empty file. Windows permits a
+        # range beyond EOF. Never truncate, replace or unlink this stable file.
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _windows_replace(source, target):
+    import ctypes
+    from ctypes import wintypes
+
+    move = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+    move.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    move.restype = wintypes.BOOL
+    # Same-directory rename only: REPLACE_EXISTING | WRITE_THROUGH, never
+    # COPY_ALLOWED. A refused replacement raises its original Windows error.
+    if not move(str(source), str(target), 0x1 | 0x8):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _publish(source, target, directory):
+    if _WINDOWS:
+        _windows_replace(source, target)
+    else:
+        os.replace(source, target)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def serialize_result(result, outcome):
@@ -95,7 +139,7 @@ class JobStore:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = os.open(self.directory / "owner.lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_owner(self.lock)
         except OSError:
             os.close(self.lock)
             self.lock = None
@@ -103,7 +147,7 @@ class JobStore:
         try:
             self.rows = {}
             for path in sorted(self.directory.glob("job-*.json")):
-                row = json.loads(path.read_text())
+                row = json.loads(path.read_text(encoding="utf-8"))
                 if row.get("version") != 1 or path != self._path(row["call_id"]):
                     raise ValueError("Invalid saved job identity/version")
                 self.rows[row["call_id"]] = row
@@ -117,26 +161,26 @@ class JobStore:
             self.lock = None
 
     def _path(self, identity):
-        return self.directory / ("job-" + hashlib.sha256(identity.encode()).hexdigest() + ".json")
+        return self.directory / ("job-" + hashlib.sha256(identity.encode("utf-8")).hexdigest() + ".json")
 
     def _write(self, row):
         if self.lock is None:
             raise RuntimeError("Job store is closed")
         fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=self.directory)
         try:
-            with os.fdopen(fd, "w") as stream:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
                 json.dump(row, stream, ensure_ascii=False)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self._path(row["call_id"]))
-            directory = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+            _publish(temporary, self._path(row["call_id"]), self.directory)
+        except BaseException as error:
             try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        finally:
-            if os.path.exists(temporary):
                 os.unlink(temporary)
+            except FileNotFoundError:
+                pass  # A POSIX directory fsync can fail after the rename.
+            except OSError as cleanup_error:
+                error.add_note(f"Job ledger temporary cleanup failed: {cleanup_error}")
+            raise
         self.rows[row["call_id"]] = row
 
     def begin(self, call, job_id, receipt, native_call=None):
