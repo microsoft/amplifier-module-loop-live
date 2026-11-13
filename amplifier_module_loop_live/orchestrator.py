@@ -8,18 +8,19 @@ extension supplies native steering and async delegate calls when selected.
 
 import asyncio
 import copy
-import inspect
 import json
 import uuid
 from collections import deque
 from contextvars import ContextVar
 
 from amplifier_core import HookResult
-from amplifier_module_loop_streaming import StreamingOrchestrator, ConversationProviderPin
+from amplifier_module_loop_streaming import (StreamingOrchestrator, ConversationProviderPin,
+                                             SettledToolResult)
 from .runtime import Input, observation
 from .provenance import InputContext, ContinuationContext, input_metadata
 from .job_store import apply_result, result_fields, settled_record
-from .host import HostAdapter, AttachmentContext
+from .host import (HostAdapter, AttachmentContext, attachment_content,
+                   attachment_message, checkpoint_attachment)
 from .scope import HOST_ADAPTER
 from .failures import ManagerTurnError, turn_failure
 from .dispatch import ApprovedDispatch
@@ -106,8 +107,13 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 await self.runtime.emit("steering.held", input_id=command.id,
                     target_generation_id=command.target_generation_id, reason="generation-ended")
                 continue
-            content = self.host.content(command, self.coordinator) if command.attachments else self._text(command)
-            await context.add_message({"role": "user", "content": content, "metadata": input_metadata(command)})
+            message = {"role": "user", "content": self._text(command), "metadata": input_metadata(command)}
+            if command.attachments:
+                encoded = await attachment_content(self.host, command, self.coordinator)
+                message = attachment_message(message, encoded)
+            await context.add_message(message)
+            if command.attachments:
+                await checkpoint_attachment(message, self.coordinator)
             await self.runtime.emit("input.delivered", input_id=command.id,
                                     delivery="request_boundary", source=command.source, call_id=command.call_id,
                                     **({"target_generation_id": command.target_generation_id} if command.target_generation_id else {}))
@@ -147,14 +153,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         if changed:
             await context.set_messages(messages)
         if self._job_media_checkpoint_pending:
-            checkpoint = self.coordinator.get_capability("session.durable_checkpoint")
-            if not callable(checkpoint):
-                raise RuntimeError("Job media requires a durable session checkpoint before provider dispatch")
-            acknowledgment = checkpoint()
-            if inspect.isawaitable(acknowledgment):
-                acknowledgment = await acknowledgment
-            if acknowledgment is False:
-                raise RuntimeError("Job media durable session checkpoint failed")
+            from amplifier_module_loop_streaming.media import checkpoint_settled_results
+            await checkpoint_settled_results(self.coordinator, has_media=True)
             # This is not a media commit report. The host's media owner must
             # validate its exact canonical save acknowledgment before hydration.
             self._job_media_checkpointed.update(self._job_media_checkpoint_pending)
@@ -267,7 +267,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     await runtime.emit("input.delivered", input_id=command.id,
                                        delivery="new_turn", source=command.source, call_id=command.call_id)
                     if command.attachments:
-                        turn_context = AttachmentContext(context, self._text(command), self.host.content(command, coordinator))
+                        encoded = await attachment_content(self.host, command, coordinator)
+                        turn_context = AttachmentContext(context, self._text(command), encoded, coordinator)
                     turn_context = InputContext(turn_context, self._text(command), command)
                 stage = "manager_turn"
                 result = await self._execute_guarded_goal(
@@ -491,11 +492,11 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             if existing.get("tool_call") != tool_call.model_dump():
                 raise RuntimeError("Tool call identity was reused with different content")
             if "settled_result" in existing:
-                from amplifier_module_loop_streaming import SettledToolResult
                 return SettledToolResult.from_legacy(existing["settled_result"])
-            return tool_call.id, tool_call.name, existing.get("result", existing["receipt"])
+            return SettledToolResult(tool_call.id, tool_call.name, existing.get("result", existing["receipt"]))
         if sum(not job["task"].done() for job in self.jobs.values()) >= self.config.get("max_background_jobs", 4):
-            return tool_call.id, tool_call.name, json.dumps({"success": False, "error": "Background job limit reached; wait for existing jobs before submitting more."})
+            return SettledToolResult(tool_call.id, tool_call.name, json.dumps({"success": False,
+                "error": "Background job limit reached; wait for existing jobs before submitting more."}), success=False)
         job_id = str(uuid.uuid4())
         runtime = self.runtime
         ledger = coordinator.get_capability("live.jobs") if coordinator else None
@@ -552,7 +553,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                              "tool_call": tool_call.model_dump(), "receipt": receipt, "status": "pending"}
         self._tool_calls_this_turn += 1
         await runtime.emit("job.queued", job_id=job_id, call_id=tool_call.id, tool=tool_call.name)
-        return tool_call.id, tool_call.name, self.jobs[job_id]["receipt"]
+        return SettledToolResult(tool_call.id, tool_call.name, self.jobs[job_id]["receipt"])
 
     async def _job_returned(self, job_id, result, outcome, injections=(), *, deliver):
         job = self.jobs[job_id]

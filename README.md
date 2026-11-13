@@ -144,6 +144,15 @@ discard that provenance. Native image transport, provider preparation, storage
 authorization, and pixel removal still require their independently qualified
 owners; streaming inheritance or a saved reference is not proof of vision.
 
+The host's `live.attachments.encode(command, coordinator)` may return legacy
+content directly or asynchronously return an explicit `{"content": ...,
+"metadata": {...}}` mapping. Both initial-turn and request-boundary attachment
+delivery retain the mapping's metadata alongside the admitted `amplifier_input`
+identity and unrelated owner namespaces. Conflicting provenance is refused, not
+overwritten. Ref-bearing attachments are checkpointed after canonical append
+through loop-streaming's shared `checkpoint_settled_results` helper and before
+the engine can count or dispatch; encoding never hydrates media in the loop.
+
 The host must supply a trusted private storage location. On POSIX, new directories
 and files request modes `0700` and `0600`; existing storage is not repaired. On
 Windows, these mode bits do **not** supply private ACLs. The host must establish
