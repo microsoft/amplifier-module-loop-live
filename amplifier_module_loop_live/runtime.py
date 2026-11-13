@@ -23,6 +23,10 @@ class Input:
     activation: object | None = field(default=None, compare=False, repr=False)
     # Opt-in: this steering input may affect only the named generation.
     target_generation_id: str | None = None
+    # Explicit internal job evidence, not parsed from service text or treated as
+    # user authority. Media stays nested here; only its original tool row may
+    # expose the namespace for request projection.
+    job_result: dict | None = None
 
 
 class _Event(tuple):

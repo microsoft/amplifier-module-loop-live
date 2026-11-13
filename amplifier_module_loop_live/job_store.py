@@ -57,9 +57,68 @@ def _publish(source, target, directory):
             os.close(fd)
 
 
+def _is_carrier(value):
+    return callable(getattr(value, "model_dump", None)) or (
+        isinstance(value, dict) and "tool_call_id" in value and "version" in value)
+
+
 def serialize_result(result, outcome):
+    if outcome == "returned" and _is_carrier(result):
+        record = settled_record(result)
+        return record["content"]
     return result if isinstance(result, str) and outcome == "returned" else json.dumps({
         "status": outcome, "tool_report": result, "effects": "not_rolled_back"})
+
+
+def settled_record(value, *, call_id=None, tool_name=None):
+    """Detach an explicit streaming carrier, never discover one in report text."""
+    if callable(getattr(value, "model_dump", None)):
+        value = value.model_dump()
+    fields = {"version", "tool_call_id", "tool_name", "content", "metadata", "result", "success"}
+    if (not isinstance(value, dict) or set(value) != fields
+            or type(value["version"]) is not int or value["version"] != 1
+            or any(not isinstance(value[key], str) for key in ("tool_call_id", "tool_name", "content"))
+            or not isinstance(value["metadata"], dict)
+            or (value["success"] is not None and type(value["success"]) is not bool)):
+        raise ValueError("Invalid settled tool result carrier")
+    if ((call_id is not None and value["tool_call_id"] != call_id)
+            or (tool_name is not None and value["tool_name"] != tool_name)):
+        raise ValueError("Settled tool result identity conflicts with job")
+    # JSON portability is not media authority. Publication belongs to streaming's
+    # effective post-hook result; resolution/checkpoint admission stays host-owned.
+    return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+
+
+def result_fields(result, outcome, *, call_id=None, tool_name=None):
+    fields = {"result": serialize_result(result, outcome)}
+    if outcome == "returned" and _is_carrier(result):
+        record = settled_record(result, call_id=call_id, tool_name=tool_name)
+        fields.update(settled_result=record, result_fingerprint=_fingerprint(record))
+    return fields
+
+
+def _fingerprint(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def apply_result(message, row):
+    """Reconcile only an exact receipt/result, preserving unrelated owner metadata."""
+    expected = (row.get("settled_result") or {}).get("metadata", {})
+    metadata = message.get("metadata") or {}
+    if not isinstance(metadata, dict) or message.get("content") not in (row["receipt"], row["result"]):
+        raise RuntimeError("Saved job conflicts with the session checkpoint")
+    receipt = message.get("content") == row["receipt"] and row["receipt"] != row["result"]
+    # Equal text is not equal media evidence. A queued receipt has no media;
+    # a terminal row must agree on every settled metadata field, including refs.
+    if (metadata.get("experimental.media.v1") != (None if receipt else expected.get("experimental.media.v1"))
+            or any(key in metadata and metadata[key] != value for key, value in expected.items())
+            or (not receipt and any(key not in metadata for key in expected))):
+        raise RuntimeError("Saved job metadata conflicts with the session checkpoint")
+    updated = {**message, "content": row["result"]}
+    if expected:
+        updated["metadata"] = {**metadata, **copy.deepcopy(expected)}
+    return updated
 
 
 class _RecoveryEvidence:
@@ -148,8 +207,17 @@ class JobStore:
             self.rows = {}
             for path in sorted(self.directory.glob("job-*.json")):
                 row = json.loads(path.read_text(encoding="utf-8"))
-                if row.get("version") != 1 or path != self._path(row["call_id"]):
+                if type(row.get("version")) is not int or row["version"] not in (1, 2) or path != self._path(row["call_id"]):
                     raise ValueError("Invalid saved job identity/version")
+                if row["version"] == 2 and "settled_result" not in row:
+                    raise ValueError("Saved v2 job is missing its settled result")
+                if "settled_result" in row:
+                    record = settled_record(row["settled_result"], call_id=row["call_id"],
+                                            tool_name=row["tool_call"]["name"])
+                    if (row["version"] != 2 or row["status"] != "returned"
+                            or row.get("result") != record["content"]
+                            or row.get("result_fingerprint") != _fingerprint(record)):
+                        raise ValueError("Saved settled result fingerprint conflicts")
                 self.rows[row["call_id"]] = row
         except BaseException:
             self.close()
@@ -193,7 +261,11 @@ class JobStore:
         row = self.rows[call_id]
         if row["status"] != "pending":
             raise RuntimeError("Saved job already has a terminal report")
-        self._write({**row, "status": outcome, "result": serialize_result(result, outcome)})
+        if outcome not in {"returned", "cancelled", "failed", "interrupted"}:
+            raise ValueError("Invalid terminal job outcome")
+        fields = result_fields(result, outcome, call_id=call_id, tool_name=row["tool_call"]["name"])
+        self._write({**row, **fields, "version": 2 if "settled_result" in fields else row["version"],
+                     "status": outcome})
 
     def recover(self, transcript):
         """Reconcile saved evidence without redispatching work.
@@ -244,13 +316,14 @@ class JobStore:
             for output in outputs:
                 # Only replace this host's exact receipt or our saved result.
                 # A conflicting checkpoint needs inspection, not an overwrite.
-                if output.get("content") not in (row["receipt"], row["result"]):
-                    raise RuntimeError("Saved job conflicts with the session checkpoint")
-                changed |= output.get("content") != row["result"]
-                output["content"] = row["result"]
+                updated = apply_result(output, row)
+                changed |= output != updated
+                output.update(updated)
             if not outputs:
                 transcript.append({"role": "tool", "tool_call_id": identity,
-                                   "name": row["tool_call"]["name"], "content": row["result"]})
+                                   "name": row["tool_call"]["name"], "content": row["result"],
+                                   **({"metadata": copy.deepcopy(row["settled_result"]["metadata"])}
+                                      if row.get("settled_result", {}).get("metadata") else {})})
             restored = not present or not outputs
             known = (row["job_id"] in evidence.notices if evidence is not None else
                      any((m.get("metadata") or {}).get("live_recovery_job") == row["job_id"] for m in transcript))
@@ -259,7 +332,8 @@ class JobStore:
             # again. This is NOT a checkpoint acknowledgment: the actual call
             # and result checks above always run, including on older histories.
             fingerprint = hashlib.sha256(json.dumps([
-                row["job_id"], identity, row["status"], row["result"]
+                row["job_id"], identity, row["status"], row["result"],
+                *([row["settled_result"]] if "settled_result" in row else [])
             ], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
             notified = known or row.get("recovery_notice") == fingerprint
             uncertain = row["status"] != "returned"

@@ -54,6 +54,12 @@ class JobControl:
         if result is not None and limit:
             row.update(report=result[offset:offset + limit], offset=offset,
                        next_offset=offset + limit if offset + limit < len(result) else None)
+            record = job.get("settled_result")
+            if record:
+                # Page only report text. Explicit refs retain order/multiplicity
+                # independently of a clipped or JSON-looking textual report.
+                row.update(result_metadata=copy.deepcopy(record["metadata"]),
+                           result_fingerprint=job["result_fingerprint"])
         return row
 
     async def execute(self, input):

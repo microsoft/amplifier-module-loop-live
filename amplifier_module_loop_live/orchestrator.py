@@ -7,6 +7,8 @@ extension supplies native steering and async delegate calls when selected.
 """
 
 import asyncio
+import copy
+import inspect
 import json
 import uuid
 from collections import deque
@@ -16,7 +18,7 @@ from amplifier_core import HookResult
 from amplifier_module_loop_streaming import StreamingOrchestrator, ConversationProviderPin
 from .runtime import Input, observation
 from .provenance import InputContext, ContinuationContext, input_metadata
-from .job_store import serialize_result
+from .job_store import apply_result, result_fields, settled_record
 from .host import HostAdapter, AttachmentContext
 from .scope import HOST_ADAPTER
 from .failures import ManagerTurnError, turn_failure
@@ -129,11 +131,26 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             if message.get("role") != "tool":
                 continue
             job = self.native_job(message.get("tool_call_id"))
-            if job and "result" in job and message.get("content") == job.get("receipt"):
-                message["content"] = job["result"]
-                changed = True
+            if job and "result" in job:
+                updated = apply_result(message, job)
+                changed |= message != updated
+                message.update(updated)
         if changed:
             await context.set_messages(messages)
+            if any((message.get("metadata") or {}).get("experimental.media.v1") for message in messages):
+                self._job_media_checkpoint_pending = True
+        if getattr(self, "_job_media_checkpoint_pending", False):
+            checkpoint = self.coordinator.get_capability("session.durable_checkpoint")
+            if not callable(checkpoint):
+                raise RuntimeError("Job media requires a durable session checkpoint before provider dispatch")
+            acknowledgment = checkpoint()
+            if inspect.isawaitable(acknowledgment):
+                acknowledgment = await acknowledgment
+            if acknowledgment is False:
+                raise RuntimeError("Job media durable session checkpoint failed")
+            # This is not a media commit report. The host's media owner must
+            # validate its exact canonical save acknowledgment before hydration.
+            self._job_media_checkpoint_pending = False
 
     async def start_native_job(self, call):
         await self._execute_tool_only(call, self.tools, self.hooks, None, self.coordinator)
@@ -334,7 +351,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                                 target_generation_id=value.target_generation_id, delivery="request_boundary")
                         # Multimodal updates enter through the normal Amplifier
                         # message serializer at the next request boundary.
-                        if native and not value.attachments and await native.steer_live(value):
+                        if native and not value.attachments and value.job_result is None and await native.steer_live(value):
                             continue
                         self.pending.append(value)
                         self.steer(_WAKE)
@@ -465,6 +482,9 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         if existing:
             if existing.get("tool_call") != tool_call.model_dump():
                 raise RuntimeError("Tool call identity was reused with different content")
+            if "settled_result" in existing:
+                from amplifier_module_loop_streaming import SettledToolResult
+                return SettledToolResult.from_legacy(existing["settled_result"])
             return tool_call.id, tool_call.name, existing.get("result", existing["receipt"])
         if sum(not job["task"].done() for job in self.jobs.values()) >= self.config.get("max_background_jobs", 4):
             return tool_call.id, tool_call.name, json.dumps({"success": False, "error": "Background job limit reached; wait for existing jobs before submitting more."})
@@ -494,8 +514,15 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 job["started"] = True
                 if job.get("cancel_requested"):
                     raise asyncio.CancelledError
-                _, _, result = await executor._execute_tool_only(
+                result = await executor._execute_tool_only(
                     tool_call, tools, hooks, parallel_group_id, coordinator)
+                if isinstance(result, (tuple, list)):
+                    # Historical streaming executes text-only three-tuples.
+                    if tuple(result[:2]) != (tool_call.id, tool_call.name):
+                        raise ValueError("Settled tool result identity conflicts with job")
+                    result = result[2]
+                else:
+                    result = settled_record(result, call_id=tool_call.id, tool_name=tool_call.name)
                 outcome, injections = "returned", executor._pending_ephemeral_injections
             except asyncio.CancelledError:
                 result, outcome = None, "cancelled"
@@ -521,16 +548,28 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
 
     async def _job_returned(self, job_id, result, outcome, injections=(), *, deliver):
         job = self.jobs[job_id]
+        fields = result_fields(result, outcome, call_id=job["call_id"],
+                               tool_name=job["tool_call"]["name"])
+        ledger = self.coordinator.get_capability("live.jobs")
+        if ledger is not None:
+            saved = ledger.rows[job["call_id"]]
+            if (saved["job_id"] != job_id or saved["status"] != outcome
+                    or any(saved.get(key) != value for key, value in fields.items())):
+                raise RuntimeError("Inbox job result conflicts with the saved ledger")
         job["status"] = outcome
-        job["result"] = serialize_result(result, outcome)
+        job.update(fields)
         await self.runtime.emit("job." + outcome, job_id=job_id, call_id=job["call_id"],
                                 outcome="tool_report" if outcome == "returned" else outcome,
                                 effects="not_rolled_back")
         if deliver:
             self._pending_ephemeral_injections.extend(injections)
             activation = self.coordinator.get_capability("live.activation")
+            record = job.get("settled_result")
             self.pending.append(Input("service", json.dumps({"job_id": job_id,
-                "call_id": job["call_id"], "status": outcome, "tool_report": result}), source="amplifier-delegate", call_id=job["call_id"],
+                "call_id": job["call_id"], "status": outcome, "tool_report": job["result"]}), source="amplifier-delegate", call_id=job["call_id"],
+                job_result={"version": 1, "job_id": job_id, "call_id": job["call_id"], "status": outcome,
+                            "metadata": copy.deepcopy(record["metadata"]) if record else {},
+                            "result_fingerprint": job.get("result_fingerprint")},
                 activation=activation.current() if activation else None))
             self.steer(_WAKE)
 
