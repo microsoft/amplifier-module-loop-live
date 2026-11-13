@@ -92,6 +92,8 @@ class Runtime:
             if previous != command:
                 raise ValueError("Command identity reused with different content")
             return command.id
+        if self.stop_requested and command.kind not in {"stop", "cancel_job"}:
+            raise RuntimeError("Session is stopping and no longer accepts work")
         if command.target_generation_id is not None:
             if command.kind != "steer" or not isinstance(command.target_generation_id, str) or not 1 <= len(command.target_generation_id) <= 128:
                 raise ValueError("A bounded generation anchor is only valid for steering")
@@ -149,6 +151,8 @@ class Runtime:
             self.generation = {"id": data["generation_id"], "initial_input_id": data.get("initial_input_id"), "input_ids": [], "accepted_input_ids": []}
         generation = self.generation
         if generation is not None:
+            if event_type in {"input.queued", "input.delivered", "input.held", "input.unknown"}:
+                data.setdefault("generation_id", generation["id"])
             if event_type in {"input.delivered", "steering.applied"}:
                 identity = data.get("input_id")
                 if identity and identity not in generation["input_ids"]:
