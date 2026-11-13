@@ -73,6 +73,12 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
     def _select_provider(self, providers):
         return self.root_provider or super()._select_provider(providers)
 
+    def _validate_input_activation(self, command):
+        activation = self.coordinator.get_capability("live.activation") if self.coordinator else None
+        if activation:
+            token = activation.bind(command.activation)
+            activation.reset(token)
+
     async def _hold_anchored(self, reason):
         self.pending.extend(self.runtime.pending_steering)
         self.runtime.pending_steering.clear()
@@ -102,6 +108,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 await self.runtime.emit("steering.held", input_id=command.id,
                     target_generation_id=command.target_generation_id, reason="generation-ended")
                 continue
+            self._validate_input_activation(command)
             content = self.host.content(command, self.coordinator) if command.attachments else self._text(command)
             await context.add_message({"role": "user", "content": content, "metadata": input_metadata(command)})
             await self.runtime.emit("input.delivered", input_id=command.id,
@@ -167,6 +174,12 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 raise
         if self.running:
             raise RuntimeError("One execute owner per manager session")
+        activation = coordinator.get_capability("live.activation")
+        if activation:
+            # Shutdown uses this task's original lifetime authority, not the
+            # last callback's epoch. Refuse malformed host startup before work.
+            token = activation.bind(activation.current())
+            activation.reset(token)
         self.running, self.runtime = True, runtime
         self.context, self.tools, self.hooks, self.coordinator = context, tools, hooks, coordinator
         from .jobs import AsyncTool, JobControl
@@ -198,7 +211,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             "submit": runtime.submit_steering})
         active = None
         last = ""
-        last_activation = None
         status = "error"
         idle = False
 
@@ -279,8 +291,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     await self._hold_anchored("generation-ended")
                 if active is None and self.pending and runtime.inbox.empty():
                     command = self.pending.popleft()
-                    # Publish busy state before scheduling: a host control can
-                    # otherwise park after dequeue but before turn() first runs.
+                    # Publish busy state before scheduling so host retirement
+                    # cannot mistake a dequeued turn for an idle owner.
                     await runtime.emit("generation.started", generation_id=str(uuid.uuid4()),
                                        initial_input_id=command.id, call_id=command.call_id)
                     active = asyncio.create_task(turn(command))
@@ -288,112 +300,113 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 if active is None and not self.pending and not self._active_jobs() and runtime.inbox.empty() and not idle:
                     idle = True
                     await runtime.emit("session.idle", text=last)
-                    # A host may relinquish its durable session writer here while
-                    # retaining this loop and its mounted modules in memory.  It
-                    # is deliberately awaited before the next inbox read: a
-                    # callback queued before release cannot cross this boundary
-                    # and start another turn without host admission.
-                    park = coordinator.get_capability("live.park")
-                    if park:
-                        await park(activation=last_activation)
                 event = await runtime.inbox.get()
                 kind, value = event
-                activation = coordinator.get_capability("live.activation")
-                if activation and not (kind == "input" and value.kind == "stop"):
-                    # The loop outlives individual acquisitions. Completion and
-                    # child events must carry the producer's token just like
-                    # user input does; never reuse its startup context token.
-                    captured = getattr(event, "activation", None)
-                    activation.bind(captured)
-                    last_activation = captured
-                if kind == "input":
-                    runtime.queued_inputs -= 1
-                    if value.activation is not None:
-                        last_activation = value.activation
-                    if value.kind == "stop":
-                        status = "cancelled" if value.target=="cancel" or active or self._active_jobs() else "completed"
-                        break
-                    if value.kind == "cancel_job":
-                        job = self.jobs.get(value.target)
-                        if job and not job["task"].done():
-                            self.cancel_job(job)
-                            await runtime.emit("job.cancel_requested", job_id=value.target)
-                        else:
-                            await runtime.emit("command.rejected", input_id=value.id, reason="no_active_job")
-                    else:
-                        idle = False
-                        if value.kind == "service":
-                            await runtime.emit("observation.received", input_id=value.id,
-                                               source=value.source, text=value.text)
-                        if value.target_generation_id is not None:
-                            if active is None or not runtime.generation or runtime.generation["id"] != value.target_generation_id:
-                                await runtime.emit("steering.held", input_id=value.id,
-                                    target_generation_id=value.target_generation_id, reason="generation-ended")
-                                continue
-                            await runtime.emit("steering.accepted", input_id=value.id,
-                                target_generation_id=value.target_generation_id, delivery="request_boundary")
-                        # Multimodal updates enter through the normal Amplifier
-                        # message serializer at the next request boundary.
-                        if native and not value.attachments and await native.steer_live(value):
-                            continue
-                        self.pending.append(value)
-                        self.steer(_WAKE)
-                        await runtime.emit("input.queued", input_id=value.id, delivery="request_boundary")
-                elif kind == "bundle_turn":
-                    await active
-                    result, error = value
-                    if error:
-                        runtime.steering_closed = True
-                        active = None
-                        await self._hold_anchored("generation-failed")
-                        cause, failure = error
-                        await runtime.emit("generation.failed", **failure)
-                        # The base engine owns provider-specific events. A local
-                        # context/setup failure is not evidence of provider failure.
-                        raise ManagerTurnError(failure) from cause
-                    last = result or last
-                    checkpoint = coordinator.get_capability("live.checkpoint")
-                    if checkpoint:
-                        await checkpoint()
-                    # Accepted input can arrive during the final response or
-                    # its checkpoint. Keep the same generation alive for it;
-                    # never replay the previous prompt or completed tools.
-                    pending = [command for command in [*self.pending, *runtime.pending_steering]
-                               if command.target_generation_id == runtime.generation['id']]
-                    if (pending and not runtime.stop_requested
-                            and not coordinator.cancellation.is_cancelled and not self._budget_exhausted):
-                        active = asyncio.create_task(turn(pending[0], continuation=True))
-                        continue
-                    # No await between the empty-queue decision and closing
-                    # admission. Later submissions fail before being accepted.
-                    runtime.steering_closed = True
-                    active = None
-                    await self._hold_anchored("generation-completed")
-                    messages = await context.get_messages()
-                    final_message = messages[-1] if messages else {}
-                    final_content = final_message.get("content", "") if final_message.get("role") == "assistant" and not final_message.get("tool_calls") else ""
-                    if isinstance(final_content, list):
-                        final_content = "".join(block.get("text", "") for block in final_content
-                                                if isinstance(block, dict) and block.get("type") in {"text", "output_text"})
-                    await runtime.emit("generation.finished", text=final_content if isinstance(final_content, str) else "",
-                        active_job_ids=[identity for identity, job in self.jobs.items() if not job["task"].done()],
-                        disposition="manager_turn_finished")
-                elif kind == "bundle_job":
-                    await self._job_returned(*value, deliver=True)
-                elif kind == "child_event":
+                if kind == "child_event":
+                    # Public status is observation, not admission to execute or
+                    # persist. A late/tokenless status must not poison this
+                    # owner's task-local activation or a completed generation.
                     await runtime.emit("child.updated", **value)
-                    if value.get("event")=="session.closed":
-                        self.pending.append(Input("service",json.dumps(value),source="amplifier-child-lifecycle",
-                                                  activation=last_activation))
-                        self.steer(_WAKE);idle=False
-                elif kind == "child_report":
-                    self.pending.append(Input("service",json.dumps(value),source="amplifier-child",
-                                              activation=last_activation))
-                    self.steer(_WAKE)
-                    idle=False
-                elif kind == "bundle_persistence_error":
+                    if value.get("event") != "session.closed":
+                        continue
+                if kind == "bundle_persistence_error":
                     await runtime.emit("persistence.failed", error_type=value)
                     raise RuntimeError("Job evidence could not be saved; inspect state before continuing")
+                activation = coordinator.get_capability("live.activation")
+                activation_token = None
+                captured = getattr(event, "activation", None)
+                if activation and not (kind == "input" and value.kind == "stop"):
+                    # Effectful callbacks retain their producer's epoch. Never
+                    # substitute the current owner's token for missing/stale work.
+                    activation_token = activation.bind(captured)
+                try:
+                    if kind == "input":
+                        runtime.queued_inputs -= 1
+                        if value.kind == "stop":
+                            status = "cancelled" if value.target=="cancel" or active or self._active_jobs() else "completed"
+                            break
+                        if value.kind == "cancel_job":
+                            self._validate_input_activation(value)
+                            job = self.jobs.get(value.target)
+                            if job and not job["task"].done():
+                                self.cancel_job(job)
+                                await runtime.emit("job.cancel_requested", job_id=value.target)
+                            else:
+                                await runtime.emit("command.rejected", input_id=value.id, reason="no_active_job")
+                        else:
+                            idle = False
+                            if value.kind == "service":
+                                await runtime.emit("observation.received", input_id=value.id,
+                                                   source=value.source, text=value.text)
+                            if value.target_generation_id is not None:
+                                if active is None or not runtime.generation or runtime.generation["id"] != value.target_generation_id:
+                                    await runtime.emit("steering.held", input_id=value.id,
+                                        target_generation_id=value.target_generation_id, reason="generation-ended")
+                                    continue
+                                await runtime.emit("steering.accepted", input_id=value.id,
+                                    target_generation_id=value.target_generation_id, delivery="request_boundary")
+                            # Multimodal updates enter through the normal Amplifier
+                            # message serializer at the next request boundary.
+                            if native and not value.attachments:
+                                self._validate_input_activation(value)
+                                if await native.steer_live(value):
+                                    continue
+                            self.pending.append(value)
+                            self.steer(_WAKE)
+                            await runtime.emit("input.queued", input_id=value.id, delivery="request_boundary")
+                    elif kind == "bundle_turn":
+                        await active
+                        result, error = value
+                        if error:
+                            runtime.steering_closed = True
+                            active = None
+                            await self._hold_anchored("generation-failed")
+                            cause, failure = error
+                            await runtime.emit("generation.failed", **failure)
+                            # The base engine owns provider-specific events. A local
+                            # context/setup failure is not evidence of provider failure.
+                            raise ManagerTurnError(failure) from cause
+                        last = result or last
+                        checkpoint = coordinator.get_capability("live.checkpoint")
+                        if checkpoint:
+                            await checkpoint()
+                        # Accepted input can arrive during the final response or
+                        # its checkpoint. Keep the same generation alive for it;
+                        # never replay the previous prompt or completed tools.
+                        pending = [command for command in [*self.pending, *runtime.pending_steering]
+                                   if command.target_generation_id == runtime.generation['id']]
+                        if (pending and not runtime.stop_requested
+                                and not coordinator.cancellation.is_cancelled and not self._budget_exhausted):
+                            active = asyncio.create_task(turn(pending[0], continuation=True))
+                            continue
+                        # No await between the empty-queue decision and closing
+                        # admission. Later submissions fail before being accepted.
+                        runtime.steering_closed = True
+                        active = None
+                        await self._hold_anchored("generation-completed")
+                        messages = await context.get_messages()
+                        final_message = messages[-1] if messages else {}
+                        final_content = final_message.get("content", "") if final_message.get("role") == "assistant" and not final_message.get("tool_calls") else ""
+                        if isinstance(final_content, list):
+                            final_content = "".join(block.get("text", "") for block in final_content
+                                                    if isinstance(block, dict) and block.get("type") in {"text", "output_text"})
+                        await runtime.emit("generation.finished", text=final_content if isinstance(final_content, str) else "",
+                            active_job_ids=[identity for identity, job in self.jobs.items() if not job["task"].done()],
+                            disposition="manager_turn_finished")
+                    elif kind == "bundle_job":
+                        await self._job_returned(*value, deliver=True)
+                    elif kind == "child_event":
+                        self.pending.append(Input("service",json.dumps(value),source="amplifier-child-lifecycle",
+                                                  activation=captured))
+                        self.steer(_WAKE);idle=False
+                    elif kind == "child_report":
+                        self.pending.append(Input("service",json.dumps(value),source="amplifier-child",
+                                                  activation=captured))
+                        self.steer(_WAKE)
+                        idle=False
+                finally:
+                    if activation and activation_token is not None:
+                        activation.reset(activation_token)
         except asyncio.CancelledError:
             status = "cancelled"
             raise

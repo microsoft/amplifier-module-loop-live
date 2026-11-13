@@ -26,7 +26,7 @@ class Input:
 
 
 class _Event(tuple):
-    """Keep tuple-compatible inbox events tied to their producing task."""
+    """Retain producer authority for effectful callbacks, not status admission."""
 
     def __new__(cls, item, activation):
         event = super().__new__(cls, item)

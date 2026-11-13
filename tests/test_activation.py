@@ -50,7 +50,7 @@ class Ownership:
 
 
 @asynccontextmanager
-async def manager(ownership, park):
+async def manager(ownership, park=None, *, native=False):
     runtime = Runtime()
     runtime.capture_activation = ownership.current
     session = AmplifierSession({"session": {
@@ -61,6 +61,18 @@ async def manager(ownership, park):
         session_id=runtime.session_id)
     await session.initialize()
     provider, tool = Provider(), Delegate()
+    if native:
+        provider.native_bundle_live = True
+        provider.steered = []
+
+        async def steer(command):
+            provider.steered.append(command)
+            return False
+
+        async def close():
+            pass
+
+        provider.steer_live, provider.close_live = steer, close
     await session.coordinator.mount("providers", provider, name="fixture")
     await session.coordinator.mount("tools", tool, name="delegate")
     checkpoints = []
@@ -81,6 +93,26 @@ async def manager(ownership, park):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await session.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_unbound_execute_fails_before_work_instead_of_losing_terminal_evidence():
+    from amplifier_module_loop_live.orchestrator import BundleLiveOrchestrator
+
+    ownership = Ownership()
+    first = ownership.activate()
+    runtime = Runtime()
+    loop = BundleLiveOrchestrator({})
+    coordinator = SimpleNamespace(get_capability=lambda name: ownership if name == "live.activation" else None)
+    bound = ownership.bound.set(None)
+    try:
+        with pytest.raises(RuntimeError, match="released or superseded"):
+            await loop._execute_live("", None, {}, {}, None, coordinator, runtime, None)
+    finally:
+        ownership.bound.reset(bound)
+    assert ownership.current() is first
+    assert not runtime.events
+    assert not loop.running
 
 
 @pytest.mark.asyncio
@@ -129,17 +161,13 @@ async def test_duplicate_receipt_survives_host_reacquisition_without_requeue():
 
 
 @pytest.mark.asyncio
-async def test_host_cannot_park_between_dequeue_and_turn_start():
+async def test_host_cannot_retire_between_dequeue_and_turn_start():
     ownership = Ownership()
     first = ownership.activate()
-
-    async def park(*, activation):
-        pass
-
-    async with manager(ownership, park) as live:
+    async with manager(ownership) as live:
         event_loop = asyncio.get_running_loop()
         previous_factory = event_loop.get_task_factory()
-        parking_attempts = []
+        retirement_attempts = []
 
         def control_finished():
             # Model a host control finishing before the newly scheduled turn
@@ -147,7 +175,7 @@ async def test_host_cannot_park_between_dequeue_and_turn_start():
             loop = live.session.coordinator.get("orchestrator")
             idle = not (live.runtime.queued_inputs or not live.runtime.inbox.empty()
                         or loop.pending or loop._active_jobs() or live.runtime.generation)
-            parking_attempts.append(idle)
+            retirement_attempts.append(idle)
             if idle:
                 ownership.release(first)
 
@@ -162,7 +190,7 @@ async def test_host_cannot_park_between_dequeue_and_turn_start():
         try:
             await live.runtime.submit(Input("user", "first after idle", id="one", activation=first))
             await live.provider.request()
-            assert parking_attempts == [False]
+            assert retirement_attempts == [False]
             await live.provider.reply("completed with ownership")
             await live.runtime.wait_for(lambda event: event["type"] == "generation.finished", 3)
             starts = [e for e in live.runtime.events if e["type"] == "generation.started"]
@@ -178,11 +206,7 @@ async def test_host_cannot_park_between_dequeue_and_turn_start():
 async def test_bad_command_activation_fails_explicitly_without_hanging(command_activation):
     ownership = Ownership()
     ownership.activate()
-
-    async def park(*, activation):
-        pass
-
-    async with manager(ownership, park) as live:
+    async with manager(ownership) as live:
         # Inbox production is admitted, but a malformed host supplied the
         # wrong turn token. This must become an explicit terminal failure.
         await live.runtime.submit(Input("user", "bad admission", activation=command_activation))
@@ -196,42 +220,33 @@ async def test_bad_command_activation_fails_explicitly_without_hanging(command_a
 
 
 @pytest.mark.asyncio
-async def test_parking_is_awaited_and_next_turn_binds_fresh_owner():
+async def test_idle_keeps_writer_and_does_not_invoke_retired_parking_callback():
     ownership = Ownership()
     first = ownership.activate()
-    entered, finish_parking = asyncio.Event(), asyncio.Event()
     parked = []
 
     async def park(*, activation):
-        if activation is None:
-            return  # Initial idle has no completed turn to relinquish.
-        ownership.release(activation)
         parked.append(activation)
-        entered.set()
-        await finish_parking.wait()
+        ownership.release(activation)
 
     async with manager(ownership, park) as live:
         await live.runtime.submit(Input("user", "first", id="one", activation=first))
         await live.provider.request()
         await live.provider.reply("first answer")
-        await asyncio.wait_for(entered.wait(), 3)
-        second = ownership.activate()
-        await live.runtime.submit(Input("user", "second", id="two", activation=second))
-        # A turn must not cross the host's pending relinquishment barrier.
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(live.provider.requests.get(), 0.03)
-        finish_parking.set()
+        await live.runtime.wait_for(lambda event: event["type"] == "session.idle"
+                                   and event.get("text") == "first answer", 3)
+        assert ownership.active is first
+        await live.runtime.submit(Input("user", "second", id="two", activation=first))
         request = await live.provider.request()
         assert "second" in str(request.messages)
         await live.provider.reply("second answer")
         await live.runtime.wait_for(lambda event: event["type"] == "generation.finished"
                                    and event["input_ids"] == ["two"], 3)
-        assert [token for token, status in live.checkpoints] == [first, second]
-        assert parked == [first, second]
+        assert [token for token, status in live.checkpoints] == [first, first]
+        assert parked == []
         await live.runtime.submit(Input("stop"))
         await asyncio.wait_for(live.task, 3)
-        # Stopping a parked manager does not reacquire or save stale context.
-        assert [token for token, status in live.checkpoints] == [first, second]
+        assert live.checkpoints[-1] == (first, "completed")
 
 
 @pytest.mark.asyncio
@@ -239,33 +254,153 @@ async def test_parking_is_awaited_and_next_turn_binds_fresh_owner():
     ("child_report", {"report": "late report"}),
     ("child_event", {"event": "session.closed"}),
     ("bundle_turn", ("late completion", None)),
+    ("bundle_job", ("old-job", "late result", "returned")),
 ])
-async def test_callback_after_release_cannot_start_work_or_checkpoint(kind, payload):
+async def test_effectful_callback_after_release_cannot_borrow_new_owner(kind, payload):
     ownership = Ownership()
     first = ownership.activate()
-    parked = asyncio.Event()
-
-    async def park(*, activation):
-        if activation is not None:
-            ownership.release(activation)
-            parked.set()
-
-    async with manager(ownership, park) as live:
+    async with manager(ownership) as live:
         await live.runtime.submit(Input("user", "first", activation=first))
         await live.provider.request()
         await live.provider.reply("complete")
-        await asyncio.wait_for(parked.wait(), 3)
+        await live.runtime.wait_for(lambda event: event["type"] == "session.idle"
+                                   and event.get("text") == "complete", 3)
         assert live.checkpoints == [(first, None)]
-        # This producer still has the retired token in its task context.
-        await live.runtime.inbox.put((kind, payload))
+        # Retain an old producer across a later acquisition. The newer writer
+        # must not be substituted for stale executable callbacks.
+        release = asyncio.Event()
+        async def old_producer():
+            await release.wait()
+            await live.runtime.inbox.put((kind, payload))
+        producer = asyncio.create_task(old_producer())
+        ownership.release(first)
+        second = ownership.activate()
+        release.set()
+        await producer
         with pytest.raises(RuntimeError, match="released or superseded"):
             await asyncio.wait_for(live.task, 3)
         assert live.provider.requests.empty()
         assert live.checkpoints == [(first, None)]
         assert live.runtime.closed
-        assert not any(event["type"] == "child.updated" for event in live.runtime.events)
+        assert ownership.current() is second
+        assert not any(event["type"] == "generation.failed" for event in live.runtime.events)
         assert len([event for event in live.runtime.events
                     if event["type"] == "generation.started"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("producer_token", ["missing", "stale", "foreign"])
+@pytest.mark.parametrize("payload", [
+    {"event": "session.ready", "sessionId": "child"},
+    {"event": "session.idle", "sessionId": "child", "report": "historical"},
+    {"sessionId": "child", "status": "completed", "callId": "call"},
+])
+async def test_status_after_completion_is_observable_without_authority_or_new_work(producer_token, payload):
+    ownership = Ownership()
+    stale = ownership.activate()
+    ownership.release(stale)
+    first = ownership.activate()
+    async with manager(ownership) as live:
+        await live.runtime.submit(Input("user", "first", id="one", activation=first))
+        await live.provider.request()
+        await live.provider.reply("complete")
+        finished = await live.runtime.wait_for(lambda e: e["type"] == "generation.finished", 3)
+        token = {"missing": None, "stale": stale, "foreign": object()}[producer_token]
+        bound = ownership.bound.set(token)
+        try:
+            await live.runtime.inbox.put(("child_event", payload))
+        finally:
+            ownership.bound.reset(bound)
+        await live.runtime.wait_for(lambda e: e["type"] == "child.updated", 3)
+        assert not live.task.done()
+        assert live.provider.requests.empty()
+        assert live.checkpoints == [(first, None)]
+        assert live.runtime.generation is None
+        assert [e for e in live.runtime.events if e["type"] == "generation.finished"] == [finished]
+        assert not any(e["type"] in {"generation.failed", "input.queued"} and e.get("input_id") != "one"
+                       for e in live.runtime.events)
+        # The invalid status token must not contaminate the next effectful
+        # callback or the owner's eventual shutdown checkpoint.
+        await live.runtime.inbox.put(("child_report", {"report": "new evidence", "callId": "call"}))
+        request = await live.provider.request()
+        assert "new evidence" in str(request.messages)
+        await live.provider.reply("observed")
+        await live.runtime.wait_for(lambda e: e["type"] == "generation.finished" and e["text"] == "observed", 3)
+        await live.runtime.submit(Input("stop"))
+        await asyncio.wait_for(live.task, 3)
+        assert live.checkpoints == [(first, None), (first, None), (first, "completed")]
+
+
+@pytest.mark.asyncio
+async def test_stop_after_writer_release_does_not_renew_or_checkpoint():
+    ownership = Ownership()
+    first = ownership.activate()
+    async with manager(ownership) as live:
+        await live.runtime.submit(Input("user", "first", activation=first))
+        await live.provider.request()
+        await live.provider.reply("complete")
+        await live.runtime.wait_for(lambda e: e["type"] == "generation.finished", 3)
+        ownership.release(first)
+        await live.runtime.submit(Input("stop"))
+        await asyncio.wait_for(live.task, 3)
+        assert ownership.active is None
+        assert live.checkpoints == [(first, None)]
+        assert live.runtime.events[-1]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_is_not_hidden_by_stale_callback_authority():
+    ownership = Ownership()
+    first = ownership.activate()
+    async with manager(ownership) as live:
+        ownership.release(first)
+        await live.runtime.inbox.put(("bundle_persistence_error", "OSError"))
+        with pytest.raises(RuntimeError, match="Job evidence could not be saved"):
+            await asyncio.wait_for(live.task, 3)
+        assert any(e["type"] == "persistence.failed" and e["error_type"] == "OSError"
+                   for e in live.runtime.events)
+        assert live.checkpoints == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_activation", [None, object()])
+@pytest.mark.parametrize("anchored", [False, True])
+async def test_invalid_busy_input_cannot_borrow_turn_activation(command_activation, anchored):
+    ownership = Ownership()
+    first = ownership.activate()
+    async with manager(ownership) as live:
+        await live.runtime.submit(Input("user", "first", activation=first))
+        await live.provider.request()
+        command = Input("steer", "MUST NOT DELIVER", id="bad", activation=command_activation)
+        if anchored:
+            await live.runtime.submit_steering(command, live.runtime.generation["id"])
+        else:
+            await live.runtime.submit(command)
+            await live.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "bad", 3)
+        live.tool.release.set()
+        await live.provider.reply(calls=[ToolCall(id="boundary", name="delegate", arguments={"async": False})])
+        with pytest.raises(RuntimeError, match="Manager turn failed"):
+            await asyncio.wait_for(live.task, 3)
+        assert live.provider.requests.empty()
+        messages = await live.session.coordinator.get("context").get_messages()
+        assert "MUST NOT DELIVER" not in str(messages)
+        assert not any(e["type"] == "input.delivered" and e["input_id"] == "bad" for e in live.runtime.events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_activation", [None, object()])
+async def test_native_steering_checks_input_token_not_just_producer(command_activation):
+    ownership = Ownership()
+    first = ownership.activate()
+    async with manager(ownership, native=True) as live:
+        await live.runtime.submit(Input("user", "first", activation=first))
+        await live.provider.request()
+        assert [c.text for c in live.provider.steered] == ["first"]
+        await live.runtime.submit(Input("steer", "MUST NOT STEER", activation=command_activation))
+        with pytest.raises(RuntimeError, match="released or superseded"):
+            await asyncio.wait_for(live.task, 3)
+        assert [c.text for c in live.provider.steered] == ["first"]
+        assert live.provider.requests.empty()
 
 
 @pytest.mark.asyncio
@@ -276,11 +411,7 @@ async def test_callback_after_release_cannot_start_work_or_checkpoint(kind, payl
 async def test_admitted_child_followup_inherits_ownership(kind, payload):
     ownership = Ownership()
     first = ownership.activate()
-
-    async def park(*, activation):
-        pass  # Hosts may retain ownership at idle.
-
-    async with manager(ownership, park) as live:
+    async with manager(ownership) as live:
         await live.runtime.inbox.put((kind, payload))
         request = await live.provider.request()
         assert "External observation" in str(request.messages)
@@ -295,11 +426,7 @@ async def test_admitted_child_followup_inherits_ownership(kind, payload):
 async def test_background_delegate_followup_keeps_its_producing_owner():
     ownership = Ownership()
     first = ownership.activate()
-
-    async def park(*, activation):
-        pass
-
-    async with manager(ownership, park) as live:
+    async with manager(ownership) as live:
         await live.runtime.submit(Input("user", "delegate this", activation=first))
         await live.provider.request()
         await live.provider.reply(calls=[ToolCall(id="work", name="delegate", arguments={})])
