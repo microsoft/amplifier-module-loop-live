@@ -106,7 +106,8 @@ def apply_result(message, row):
     """Reconcile only an exact receipt/result, preserving unrelated owner metadata."""
     expected = (row.get("settled_result") or {}).get("metadata", {})
     metadata = message.get("metadata") or {}
-    if not isinstance(metadata, dict) or message.get("content") not in (row["receipt"], row["result"]):
+    if (not isinstance(metadata, dict) or message.get("content") not in (row["receipt"], row["result"])
+            or (message.get("name") is not None and message["name"] != row["tool_call"]["name"])):
         raise RuntimeError("Saved job conflicts with the session checkpoint")
     receipt = message.get("content") == row["receipt"] and row["receipt"] != row["result"]
     # Equal text is not equal media evidence. A queued receipt has no media;

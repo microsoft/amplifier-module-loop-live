@@ -96,6 +96,23 @@ class CarrierLedgerTests(unittest.TestCase):
                     self.store.recover([{"role": "tool", "tool_call_id": "call",
                                          "content": row["result"], "metadata": metadata}])
 
+    def test_ref_order_and_multiplicity_are_part_of_evidence(self):
+        value = carrier()
+        refs = value["metadata"][MEDIA]["refs"]
+        refs.append(copy.deepcopy(carrier(digest="b")["metadata"][MEDIA]["refs"][0]))
+        row = self.finish(value)
+        for replacement in (refs[:1], list(reversed(refs))):
+            metadata = {**value["metadata"], MEDIA: {"refs": replacement}}
+            with self.subTest(refs=replacement), self.assertRaisesRegex(RuntimeError, "metadata conflicts"):
+                self.store.recover([{"role": "tool", "tool_call_id": "call",
+                                     "content": row["result"], "metadata": metadata}])
+
+    def test_checkpoint_cannot_change_tool_name_even_with_matching_refs(self):
+        row = self.finish()
+        with self.assertRaisesRegex(RuntimeError, "conflicts"):
+            self.store.recover([{"role": "tool", "tool_call_id": "call", "name": "other-tool",
+                                 "content": row["result"], "metadata": carrier()["metadata"]}])
+
     def test_duplicate_output_conflict_is_not_hidden_by_matching_first_output(self):
         row = self.finish()
         outputs = [{"role": "tool", "tool_call_id": "call", "content": row["result"],
@@ -270,6 +287,24 @@ class LiveCarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(MEDIA, page.output)
         self.assertNotIn("result_metadata", page.output)
 
+    async def test_pending_wait_wakes_with_explicit_metadata_after_inbox_settlement(self):
+        job_id, _ = await self.launch()
+        waiting = asyncio.Event()
+        original = self.loop.runtime.wait_for
+        async def wait_for(*args, **kwargs):
+            waiting.set()
+            return await original(*args, **kwargs)
+        self.loop.runtime.wait_for = wait_for
+        waiter = asyncio.create_task(JobControl(self.loop).execute(
+            {"action": "wait", "job_id": job_id, "limit": 3, "timeout": 2}))
+        await asyncio.wait_for(waiting.wait(), 2)
+        _, args = self.loop.runtime.inbox.get_nowait()
+        await self.loop._job_returned(*args, deliver=True)
+        result = await asyncio.wait_for(waiter, 2)
+        self.assertEqual(result.output["wake_reason"], "settled")
+        self.assertEqual(result.output["report"], carrier()["content"][:3])
+        self.assertEqual(result.output["result_metadata"], carrier()["metadata"])
+
     async def test_synchronize_at_original_call_retains_owner_metadata(self):
         _, job = await self.returned()
         self.capabilities["session.durable_checkpoint"] = AsyncMock(return_value={"saved": True})
@@ -304,6 +339,43 @@ class LiveCarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kind, "bundle_persistence_error")
         self.assertFalse(self.loop.pending)
         self.assertFalse(any(e["type"] == "job.returned" for e in self.loop.runtime.events))
+
+    async def test_recovered_exact_metadata_requires_fresh_host_checkpoint(self):
+        _, job = await self.returned()
+        context = Context([{"role": "tool", "tool_call_id": "call", "content": job["result"],
+                            "metadata": carrier()["metadata"]}])
+        with self.assertRaisesRegex(RuntimeError, "durable session checkpoint"):
+            await self.loop._synchronize_job_results(context)
+        checkpoint = AsyncMock(return_value={"saved": True})
+        self.capabilities["session.durable_checkpoint"] = checkpoint
+        await self.loop._synchronize_job_results(context)
+        checkpoint.assert_awaited_once()
+
+    async def test_context_install_lost_ack_keeps_checkpoint_requirement(self):
+        _, job = await self.returned()
+        context = Context([{"role": "tool", "tool_call_id": "call", "content": job["receipt"]}])
+        install = context.set_messages
+        async def lost_ack(messages):
+            await install(messages)
+            raise OSError("installed, acknowledgment lost")
+        context.set_messages = lost_ack
+        with self.assertRaisesRegex(OSError, "acknowledgment lost"):
+            await self.loop._synchronize_job_results(context)
+        self.assertEqual(context.messages[0]["content"], job["result"])
+        with self.assertRaisesRegex(RuntimeError, "durable session checkpoint"):
+            await self.loop._synchronize_job_results(context)
+        checkpoint = AsyncMock(return_value={"saved": True})
+        self.capabilities["session.durable_checkpoint"] = checkpoint
+        await self.loop._synchronize_job_results(context)
+        checkpoint.assert_awaited_once()
+
+    async def test_unrelated_media_does_not_gate_legacy_text_job(self):
+        _, job = await self.returned(("call", "delegate", "legacy text"))
+        context = Context([{"role": "tool", "tool_call_id": "call", "content": job["receipt"]},
+                           {"role": "user", "content": "other", "metadata": carrier()["metadata"]}])
+        await self.loop._synchronize_job_results(context)
+        self.assertEqual(context.messages[0]["content"], "legacy text")
+        self.assertFalse(self.loop._job_media_checkpoint_pending)
 
     async def test_inbox_mutation_cannot_replace_already_saved_carrier(self):
         with tempfile.TemporaryDirectory() as directory:

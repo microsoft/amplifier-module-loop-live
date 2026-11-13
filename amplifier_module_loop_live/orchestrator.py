@@ -37,6 +37,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         self.runtime = None
         self.pending = deque()
         self.jobs = {}
+        self._job_media_checkpointed = set()
+        self._job_media_checkpoint_pending = set()
         self.load_failures = []
         self.running = False
         self.root_provider = None
@@ -133,13 +135,18 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             job = self.native_job(message.get("tool_call_id"))
             if job and "result" in job:
                 updated = apply_result(message, job)
-                changed |= message != updated
+                row_changed = message != updated
+                changed |= row_changed
+                if (job.get("settled_result", {}).get("metadata") or {}).get("experimental.media.v1"):
+                    identity = (job.get("job_id", job["call_id"]), job["result_fingerprint"])
+                    if row_changed or identity not in self._job_media_checkpointed:
+                        # Arm before context publication: it may install the
+                        # refs and then lose acknowledgment or be cancelled.
+                        self._job_media_checkpoint_pending.add(identity)
                 message.update(updated)
         if changed:
             await context.set_messages(messages)
-            if any((message.get("metadata") or {}).get("experimental.media.v1") for message in messages):
-                self._job_media_checkpoint_pending = True
-        if getattr(self, "_job_media_checkpoint_pending", False):
+        if self._job_media_checkpoint_pending:
             checkpoint = self.coordinator.get_capability("session.durable_checkpoint")
             if not callable(checkpoint):
                 raise RuntimeError("Job media requires a durable session checkpoint before provider dispatch")
@@ -150,7 +157,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 raise RuntimeError("Job media durable session checkpoint failed")
             # This is not a media commit report. The host's media owner must
             # validate its exact canonical save acknowledgment before hydration.
-            self._job_media_checkpoint_pending = False
+            self._job_media_checkpointed.update(self._job_media_checkpoint_pending)
+            self._job_media_checkpoint_pending.clear()
 
     async def start_native_job(self, call):
         await self._execute_tool_only(call, self.tools, self.hooks, None, self.coordinator)
