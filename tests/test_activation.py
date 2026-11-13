@@ -250,13 +250,14 @@ async def test_idle_keeps_writer_and_does_not_invoke_retired_parking_callback():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("producer_token", ["stale", "missing", "foreign"])
 @pytest.mark.parametrize("kind,payload", [
-    ("child_report", {"report": "late report"}),
-    ("child_event", {"event": "session.closed"}),
+    ("child_report", {"sessionId": "child", "callId": "child-call", "reports": 2, "report": "late report"}),
+    ("child_event", {"sessionId": "child", "callId": "child-call", "event": "session.closed"}),
     ("bundle_turn", ("late completion", None)),
     ("bundle_job", ("old-job", "late result", "returned")),
 ])
-async def test_effectful_callback_after_release_cannot_borrow_new_owner(kind, payload):
+async def test_effectful_callback_after_release_cannot_borrow_new_owner(kind, payload, producer_token):
     ownership = Ownership()
     first = ownership.activate()
     async with manager(ownership) as live:
@@ -266,26 +267,101 @@ async def test_effectful_callback_after_release_cannot_borrow_new_owner(kind, pa
         await live.runtime.wait_for(lambda event: event["type"] == "session.idle"
                                    and event.get("text") == "complete", 3)
         assert live.checkpoints == [(first, None)]
-        # Retain an old producer across a later acquisition. The newer writer
-        # must not be substituted for stale executable callbacks.
+        loop = live.session.coordinator.get("orchestrator")
+        context = live.session.coordinator.get("context")
+        if kind == "bundle_job":
+            # A known queued call gives the rejected callback a real identity.
+            # Its result must not overwrite the receipt under another epoch.
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(None)
+            loop.jobs["old-job"] = {"task": done, "call_id": "job-call",
+                                    "receipt": "queued receipt", "status": "pending"}
+            await context.add_message({"role": "tool", "tool_call_id": "job-call", "content": "queued receipt"})
+        messages = await context.get_messages()
+        # Missing/foreign producers arrive while lifetime ownership is valid;
+        # stale producers retain an old token across a later acquisition.
         release = asyncio.Event()
         async def old_producer():
             await release.wait()
             await live.runtime.inbox.put((kind, payload))
-        producer = asyncio.create_task(old_producer())
-        ownership.release(first)
-        second = ownership.activate()
+        bound = ownership.bound.set({"stale": first, "missing": None, "foreign": object()}[producer_token])
+        try:
+            producer = asyncio.create_task(old_producer())
+        finally:
+            ownership.bound.reset(bound)
+        caller_token = first
+        if producer_token == "stale":
+            ownership.release(first)
+            caller_token = ownership.activate()
         release.set()
         await producer
         with pytest.raises(RuntimeError, match="released or superseded"):
             await asyncio.wait_for(live.task, 3)
         assert live.provider.requests.empty()
-        assert live.checkpoints == [(first, None)]
+        assert live.tool.calls == 0
+        assert live.checkpoints == ([(first, None)] if producer_token == "stale"
+                                    else [(first, None), (first, "error")])
         assert live.runtime.closed
-        assert ownership.current() is second
+        assert ownership.current() is caller_token
+        assert await context.get_messages() == messages
+        assert not loop.pending
+        rejected = [event for event in live.runtime.events if event["type"] == "command.rejected"]
+        assert len(rejected) == 1
+        assert rejected[0]["callback_kind"] == kind
+        assert rejected[0]["delivery"] == "not_admitted"
+        assert rejected[0]["reason"] == "invalid_activation"
+        assert rejected[0]["outcome"] == "unknown"
+        if kind in {"child_report", "child_event"}:
+            assert rejected[0]["child_session_id"] == "child"
+            assert rejected[0]["call_id"] == "child-call"
+        if kind == "child_report":
+            assert rejected[0]["report_index"] == 2
+        if kind == "bundle_job":
+            assert rejected[0]["job_id"] == "old-job"
+            assert rejected[0]["call_id"] == "job-call"
+            assert loop.jobs["old-job"]["status"] == "pending"
+            assert "result" not in loop.jobs["old-job"]
+            assert not any(event["type"] == "job.returned" for event in live.runtime.events)
+        assert all("activation" not in event for event in live.runtime.events)
         assert not any(event["type"] == "generation.failed" for event in live.runtime.events)
         assert len([event for event in live.runtime.events
                     if event["type"] == "generation.started"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_rejection_observer_failure_does_not_replace_activation_error():
+    ownership = Ownership()
+    first = ownership.activate()
+    async with manager(ownership) as live:
+        original = RuntimeError("exact activation failure")
+        bind = ownership.bind
+
+        def reject(token):
+            if token is None:
+                raise original
+            return bind(token)
+
+        def observer(event):
+            if event["type"] == "command.rejected":
+                raise ValueError("private observer detail")
+
+        ownership.bind = reject
+        live.runtime.observer = observer
+        bound = ownership.bound.set(None)
+        try:
+            await live.runtime.inbox.put(("child_report", {"sessionId": "child", "callId": "call"}))
+        finally:
+            ownership.bound.reset(bound)
+        with pytest.raises(RuntimeError, match="exact activation failure") as failure:
+            await asyncio.wait_for(live.task, 3)
+        assert failure.value is original
+        assert original.__notes__ == ["Callback rejection observation failed: ValueError"]
+        assert any(event["type"] == "command.rejected" and event["child_session_id"] == "child"
+                   and event["call_id"] == "call" for event in live.runtime.events)
+        assert live.checkpoints == [(first, "error")]
+        assert live.provider.requests.empty()
+        assert live.tool.calls == 0
+        assert ownership.current() is first
 
 
 @pytest.mark.asyncio

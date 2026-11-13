@@ -33,6 +33,11 @@ completion is **not** status-only: it can deliver follow-up input or checkpoint
 state and must retain the original producer's valid token. Generated service
 inputs use that exact token, never the newest acquisition. Event bindings are
 task-local and reset after handling. Actual persistence failures still fail.
+If binding a dequeued callback fails, `command.rejected` records its
+`callback_kind`, available input/child/report/job/call identities,
+`delivery: not_admitted`, `reason: invalid_activation` and `outcome: unknown`
+before the original error propagates. This observation does not apply the result,
+append follow-up context, verify external effects or authorize a retry.
 
 Explicit inputs retain their own activation check at execution, request-boundary
 delivery and native steering. Tool dispatch and host persistence must likewise

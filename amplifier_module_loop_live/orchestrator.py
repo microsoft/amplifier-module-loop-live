@@ -318,7 +318,27 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 if activation and not (kind == "input" and value.kind == "stop"):
                     # Effectful callbacks retain their producer's epoch. Never
                     # substitute the current owner's token for missing/stale work.
-                    activation_token = activation.bind(captured)
+                    try:
+                        activation_token = activation.bind(captured)
+                    except Exception as exc:
+                        # Dequeue is not delivery. Keep the rejected callback's
+                        # identity observable without applying its result or
+                        # borrowing this execution's valid token.
+                        identity = {}
+                        if kind == "input":
+                            identity["input_id"] = value.id
+                        elif kind in {"child_report", "child_event"}:
+                            identity = {"child_session_id": value.get("sessionId"),
+                                        "call_id": value.get("callId"), "report_index": value.get("reports")}
+                        elif kind == "bundle_job":
+                            identity = {"job_id": value[0],
+                                        "call_id": self.jobs.get(value[0], {}).get("call_id")}
+                        try:
+                            await runtime.emit("command.rejected", callback_kind=kind,
+                                reason="invalid_activation", delivery="not_admitted", outcome="unknown", **identity)
+                        except Exception as notice_error:
+                            exc.add_note("Callback rejection observation failed: " + type(notice_error).__name__)
+                        raise
                 try:
                     if kind == "input":
                         runtime.queued_inputs -= 1
