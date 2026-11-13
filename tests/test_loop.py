@@ -35,6 +35,26 @@ class Provider:
     async def reply(self, text="", calls=None):
         await self.responses.put(ChatResponse(content=[TextBlock(text=text)], tool_calls=calls))
 
+class NativeProvider(Provider):
+    """Native callback fixture, not a remote acceptance simulator."""
+    native_bundle_live = True
+    def __init__(self, runtime):
+        super().__init__()
+        self.runtime, self.steered = runtime, []
+        self.native_result = True
+    async def steer_live(self, command):
+        if self.runtime.generation is None:
+            return False
+        self.steered.append(command)
+        if isinstance(self.native_result, BaseException):
+            raise self.native_result
+        if self.native_result:
+            await self.runtime.emit("steering.accepted", input_id=command.id,
+                target_generation_id=self.runtime.generation["id"], delivery="native")
+        return self.native_result
+    async def close_live(self):
+        pass
+
 class Delegate:
     name = "delegate"
     description = "Controlled delegate"
@@ -48,6 +68,332 @@ class Delegate:
         return ToolResult(success=True, output={"report": "CHILD-RESULT"})
 
 class BundleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ordinary_native_midstep_keeps_identity_and_provider_ownership(self):
+        await self.start(native=True)
+        await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        command = Input("user", "MIDSTEP", id="midstep")
+        await self.runtime.submit(command)
+        event = await self.runtime.wait_for(lambda e: e["type"] == "steering.accepted", 3)
+        self.assertEqual(event["target_generation_id"], generation)
+        self.assertEqual(self.provider.steered, [command])
+        self.assertIs(self.runtime.accepted["midstep"], command)
+        await self.runtime.submit(command)
+        with self.assertRaises(ValueError):
+            await self.runtime.submit(Input("user", "DIFFERENT", id="midstep"))
+        await self.provider.reply("native attempt pending")
+        finished = await self.runtime.wait_for(lambda e: e["type"] == "generation.finished", 3)
+        self.assertEqual(finished["accepted_input_ids"], ["midstep"])
+        self.assertNotIn("midstep", finished["input_ids"])
+        self.assertEqual(len(self.provider.steered), 1)
+        self.assertFalse(any(e["type"] == "input.queued" and e["input_id"] == "midstep"
+                             for e in self.runtime.events))
+        self.assertTrue(self.provider.requests.empty())
+
+    async def test_ordinary_boundary_head_blocks_native_overtaking(self):
+        await self.start(native=True)
+        await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
+        await self.provider.request()
+        self.provider.native_result = False
+        await self.runtime.submit(Input("user", "FIRST", id="first"))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "first", 3)
+        self.provider.native_result = True
+        await self.runtime.submit(Input("user", "SECOND", id="second"))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "second", 3)
+        self.assertEqual([c.id for c in self.provider.steered], ["first"])
+        self.tool.release.set()
+        await self.provider.reply(calls=[ToolCall(id="boundary", name="delegate", arguments={"async": False})])
+        request = await self.provider.request()
+        text = str(request.messages)
+        self.assertLess(text.index("FIRST"), text.index("SECOND"))
+        self.assertEqual(text.count("FIRST"), 1)
+        self.assertEqual(text.count("SECOND"), 1)
+        await self.runtime.submit(Input("user", "THIRD", id="third"))
+        await self.runtime.wait_for(lambda e: e["type"] == "steering.accepted" and e["input_id"] == "third", 3)
+        self.assertEqual([c.id for c in self.provider.steered], ["first", "third"])
+
+    async def test_ordinary_attachment_drain_blocks_native_until_request_prepared(self):
+        await self.start(native=True)
+        coordinator = self.session.coordinator
+        coordinator.register_capability("live.attachments.encode", lambda c, _: c.text + "-ATTACHMENT")
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        context = coordinator.get("context")
+        original = context.add_message
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def add(message):
+            if message.get("metadata", {}).get("amplifier_input", {}).get("id") == "attachment":
+                entered.set()
+                await release.wait()
+            return await original(message)
+        context.add_message = add
+        await self.runtime.submit(Input("user", "FIRST", id="attachment", attachments=("fixture",)))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "attachment", 3)
+        self.tool.release.set()
+        await self.provider.reply(calls=[ToolCall(id="boundary", name="delegate", arguments={"async": False})])
+        await asyncio.wait_for(entered.wait(), 3)
+        await self.runtime.submit(Input("user", "SECOND", id="second"))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "second", 3)
+        self.assertEqual(self.provider.steered, [])
+        release.set()
+        first = await self.provider.request()
+        self.assertIn("FIRST-ATTACHMENT", str(first.messages))
+        await self.provider.reply("first boundary answer")
+        second = await self.provider.request()
+        self.assertLess(str(second.messages).index("FIRST-ATTACHMENT"), str(second.messages).index("SECOND"))
+        self.assertEqual(self.provider.steered, [])
+
+    async def test_ordinary_checkpoint_inbox_continues_same_generation(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def checkpoint(*_args):
+            entered.set()
+            await release.wait()
+        self.session.coordinator.register_capability("live.checkpoint", checkpoint)
+        await self.provider.reply("first answer")
+        await asyncio.wait_for(entered.wait(), 3)
+        for i in range(3):
+            await self.runtime.submit(Input("user", f"LATE-{i}", id=f"late-{i}"))
+        release.set()
+        request = await self.provider.request()
+        self.assertEqual(self.runtime.generation["id"], generation)
+        text = str(request.messages)
+        self.assertEqual(text.count("ORIGINAL"), 1)
+        self.assertEqual([text.index(f"LATE-{i}") for i in range(3)],
+                         sorted(text.index(f"LATE-{i}") for i in range(3)))
+        self.assertTrue(all(text.count(f"LATE-{i}") == 1 for i in range(3)))
+        await self.provider.reply("updated")
+        finished = await self.runtime.wait_for(lambda e: e["type"] == "generation.finished", 3)
+        self.assertEqual(finished["input_ids"], ["original", "late-0", "late-1", "late-2"])
+        for event in self.runtime.events:
+            if event["type"] in {"input.queued", "input.delivered"} and event.get("input_id", "").startswith("late-"):
+                self.assertEqual((event["delivery"], event["generation_id"], event["source"]),
+                                 ("request_boundary", generation, "user"))
+
+    async def test_ordinary_native_exception_never_falls_back(self):
+        await self.start(native=True)
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        self.provider.native_result = RuntimeError("uncertain native effect")
+        await self.runtime.submit(Input("user", "NO REPLAY", id="uncertain"))
+        with self.assertRaisesRegex(Exception, "uncertain native effect"):
+            await asyncio.wait_for(self.task, 3)
+        self.assertFalse(any(e["type"] in {"input.queued", "input.delivered", "input.held"}
+                             and e.get("input_id") == "uncertain" for e in self.runtime.events))
+        unknown = [e for e in self.runtime.events if e["type"] == "input.unknown" and e["input_id"] == "uncertain"]
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0]["delivery"], "native")
+        self.assertTrue(self.provider.requests.empty())
+
+    async def test_ordinary_context_inserted_but_unprepared_still_blocks_native(self):
+        await self.start(native=True)
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        context = self.session.coordinator.get("context")
+        original = context.get_messages_for_request
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def messages(*args, **kwargs):
+            if self.loop._boundary_pending:
+                entered.set()
+                await release.wait()
+            return await original(*args, **kwargs)
+        context.get_messages_for_request = messages
+        self.provider.native_result = False
+        await self.runtime.submit(Input("user", "FIRST", id="first"))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "first", 3)
+        self.tool.release.set()
+        await self.provider.reply(calls=[ToolCall(id="boundary", name="delegate", arguments={"async": False})])
+        await asyncio.wait_for(entered.wait(), 3)
+        self.assertFalse(self.loop.pending)
+        self.provider.native_result = True
+        await self.runtime.submit(Input("user", "SECOND", id="second"))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "second", 3)
+        self.assertEqual([c.id for c in self.provider.steered], ["first"])
+        release.set()
+        await self.provider.request()
+
+    async def test_ordinary_after_closed_admission_starts_new_generation(self):
+        await self.start(native=True)
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        context = self.session.coordinator.get("context")
+        original = context.get_messages
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def messages():
+            if self.runtime.steering_closed:
+                entered.set()
+                await release.wait()
+            return await original()
+        context.get_messages = messages
+        await self.provider.reply("done")
+        await asyncio.wait_for(entered.wait(), 3)
+        await self.runtime.submit(Input("user", "NEW TURN", id="new"))
+        release.set()
+        request = await self.provider.request()
+        self.assertEqual(str(request.messages).count("NEW TURN"), 1)
+        self.assertNotEqual(self.runtime.generation["id"], generation)
+        self.assertEqual(self.provider.steered, [])
+        delivered = next(e for e in self.runtime.events if e["type"] == "input.delivered" and e["input_id"] == "new")
+        self.assertEqual(delivered["delivery"], "new_turn")
+        self.assertEqual(delivered["generation_id"], self.runtime.generation["id"])
+
+    async def test_stop_during_ordinary_partial_context_write_is_unknown(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        context = self.session.coordinator.get("context")
+        original = context.add_message
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def add(message):
+            await original(message)
+            if message.get("metadata", {}).get("amplifier_input", {}).get("id") == "partial":
+                entered.set()
+                await release.wait()
+        context.add_message = add
+        await self.runtime.submit(Input("user", "PARTIAL", id="partial"))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "partial", 3)
+        self.tool.release.set()
+        await self.provider.reply(calls=[ToolCall(id="boundary", name="delegate", arguments={"async": False})])
+        await asyncio.wait_for(entered.wait(), 3)
+        await self.runtime.submit(Input("stop", target="cancel"))
+        await asyncio.wait_for(self.task, 3)
+        unknown = [e for e in self.runtime.events if e["type"] == "input.unknown" and e["input_id"] == "partial"]
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0]["delivery"], "request_boundary")
+        self.assertFalse(any(e["type"] == "input.held" and e["input_id"] == "partial" for e in self.runtime.events))
+        self.assertIn("PARTIAL", str(await context.get_messages()))
+        self.assertTrue(self.provider.requests.empty())
+
+    async def test_native_provider_owned_boundary_fallback_is_not_enqueued_twice(self):
+        await self.start(native=True)
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        async def steer(command):
+            # Mirrors a definitive preaccept refusal handled by the provider,
+            # which still returns True because it owns the fallback.
+            self.loop.pending.append(command)
+            self.loop.steer("[loop-live inbox wake]")
+            return True
+        self.provider.steer_live = steer
+        command = Input("user", "OWNED FALLBACK", id="owned")
+        await self.runtime.submit(command)
+        await self.runtime.wait_for(lambda e: e["type"] == "input.accepted" and e["input_id"] == "owned", 3)
+        self.tool.release.set()
+        await self.provider.reply(calls=[ToolCall(id="boundary", name="delegate", arguments={"async": False})])
+        request = await self.provider.request()
+        self.assertEqual(str(request.messages).count("OWNED FALLBACK"), 1)
+        self.assertEqual(len([e for e in self.runtime.events if e["type"] == "input.delivered" and e["input_id"] == "owned"]), 1)
+        self.assertIs(self.runtime.accepted["owned"], command)
+
+    async def test_stop_during_native_attempt_keeps_owned_input_out_of_fallback(self):
+        await self.start(native=True)
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def steer(command):
+            entered.set()
+            await release.wait()
+            return True
+        self.provider.steer_live = steer
+        await self.runtime.submit(Input("user", "NATIVE PENDING", id="native"))
+        await asyncio.wait_for(entered.wait(), 3)
+        await self.runtime.submit(Input("user", "LOCAL INBOX", id="local"))
+        await self.runtime.submit(Input("stop", target="cancel"))
+        release.set()
+        await asyncio.wait_for(self.task, 3)
+        self.assertFalse(any(e["type"] in {"input.queued", "input.delivered", "input.held"}
+                             and e.get("input_id") == "native" for e in self.runtime.events))
+        self.assertEqual([e["input_id"] for e in self.runtime.events if e["type"] == "input.held"], ["local"])
+        self.assertTrue(self.provider.requests.empty())
+
+    async def test_stop_at_checkpoint_holds_ordinary_inbox_in_original_generation(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def checkpoint(*_args):
+            entered.set()
+            await release.wait()
+        self.session.coordinator.register_capability("live.checkpoint", checkpoint)
+        await self.provider.reply("done")
+        await asyncio.wait_for(entered.wait(), 3)
+        await self.runtime.submit(Input("user", "NOT DELIVERED", id="late"))
+        await self.runtime.submit(Input("stop", target="cancel"))
+        release.set()
+        await asyncio.wait_for(self.task, 3)
+        held = [e for e in self.runtime.events if e["type"] == "input.held" and e["input_id"] == "late"]
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["generation_id"], generation)
+        self.assertTrue(self.provider.requests.empty())
+
+    async def test_completion_marker_yields_once_not_forever_to_service_callbacks(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        checkpoints = []
+        async def checkpoint(*_args):
+            checkpoints.append(generation)
+            await self.runtime.submit(Input("service", "CALLBACK", source="fixture",
+                                            id=f"callback-{len(checkpoints)}"))
+        self.session.coordinator.register_capability("live.checkpoint", checkpoint)
+        await self.provider.reply("done")
+        finished = await self.runtime.wait_for(lambda e: e["type"] == "generation.finished", 3)
+        self.assertEqual(finished["generation_id"], generation)
+        self.assertEqual(checkpoints, [generation])
+        await self.provider.request()
+        self.assertNotEqual(self.runtime.generation["id"], generation)
+
+    async def test_indeterminate_native_return_is_unknown_not_fallback(self):
+        await self.start(native=True)
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        self.provider.native_result = None
+        await self.runtime.submit(Input("user", "UNCERTAIN", id="unknown"))
+        with self.assertRaisesRegex(Exception, "definitive ownership"):
+            await asyncio.wait_for(self.task, 3)
+        self.assertEqual(len([e for e in self.runtime.events if e["type"] == "input.unknown" and e["input_id"] == "unknown"]), 1)
+        self.assertFalse(any(e["type"] == "input.queued" and e["input_id"] == "unknown" for e in self.runtime.events))
+
+    async def test_failure_holds_ordinary_local_pending_without_falling_forward(self):
+        await self.start()
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        await self.runtime.submit(Input("user", "NOT DELIVERED", id="pending"))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "pending", 3)
+        await self.provider.responses.put(RuntimeError("fixture failure"))
+        with self.assertRaisesRegex(Exception, "Manager turn failed"):
+            await asyncio.wait_for(self.task, 3)
+        held = [e for e in self.runtime.events if e["type"] == "input.held" and e["input_id"] == "pending"]
+        self.assertEqual(len(held), 1)
+        self.assertEqual((held[0]["generation_id"], held[0]["delivery"]), (generation, "request_boundary"))
+        self.assertTrue(self.provider.requests.empty())
+        self.assertFalse(self.loop.pending)
+
+    async def test_stop_holds_ordinary_pending_and_inbox_without_replay(self):
+        await self.start(native=True)
+        await self.runtime.submit(Input("user", "ORIGINAL"))
+        await self.provider.request()
+        generation = self.runtime.generation["id"]
+        self.provider.native_result = False
+        await self.runtime.submit(Input("user", "PENDING", id="pending"))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued" and e["input_id"] == "pending", 3)
+        await self.runtime.submit(Input("user", "INBOX", id="inbox"))
+        await self.runtime.submit(Input("stop", target="cancel"))
+        await asyncio.wait_for(self.task, 3)
+        held = [e for e in self.runtime.events if e["type"] == "input.held"]
+        self.assertEqual({e["input_id"] for e in held}, {"pending", "inbox"})
+        self.assertTrue(all(e["generation_id"] == generation for e in held))
+        self.assertFalse(self.loop.pending)
+        self.assertTrue(self.provider.requests.empty())
+
     async def test_anchored_steering_applies_only_to_its_current_generation(self):
         await self.start()
         await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
@@ -309,14 +655,14 @@ class BundleTests(unittest.IsolatedAsyncioTestCase):
         events = [e for e in self.runtime.events if e["type"] == "assistant.delta"]
         self.assertEqual([e["text"] for e in events], ["text"])
 
-    async def start(self, *, manager=True):
+    async def start(self, *, manager=True, native=False):
         self.runtime = Runtime()
         self.session = AmplifierSession({"session": {
             "orchestrator": {"module": "loop-live", "config": {"configured_bundle": True,
                 "background_delegate": True, "min_delay_between_calls_ms": 0}},
             "context": {"module": "context-simple"}}, "providers": []}, session_id=self.runtime.session_id)
         await self.session.initialize()
-        self.provider, self.tool = Provider(), Delegate()
+        self.provider, self.tool = NativeProvider(self.runtime) if native else Provider(), Delegate()
         await self.session.coordinator.mount("providers", self.provider, name="fixture")
         await self.session.coordinator.mount("tools", self.tool, name="delegate")
         self.loop = self.session.coordinator.get("orchestrator")
@@ -466,7 +812,7 @@ class BundleTests(unittest.IsolatedAsyncioTestCase):
         await self.provider.reply("denied")
 
 
-    async def test_input_after_last_request_is_delivered_in_next_turn(self):
+    async def test_ordinary_input_after_last_request_continues_current_generation(self):
         await self.start()
         sent = False
         async def late_input(event, data):
@@ -478,9 +824,11 @@ class BundleTests(unittest.IsolatedAsyncioTestCase):
         self.session.coordinator.hooks.register("orchestrator:complete", late_input)
         await self.runtime.submit(Input("user", "first"))
         await self.provider.request()
+        generation = self.runtime.generation["id"]
         await self.provider.reply("first done")
         request = await self.provider.request()
         self.assertEqual(str(request.messages).count("LATE-CORRECTION"), 1)
+        self.assertEqual(self.runtime.generation["id"], generation)
         await self.provider.reply("late correction done")
         await self.runtime.wait_for(lambda e: e["type"] == "input.delivered" and e["input_id"] == "late", 3)
 

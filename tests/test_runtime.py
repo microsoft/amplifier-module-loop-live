@@ -37,6 +37,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await runtime.submit(Input("user", "late"))
 
+    async def test_stop_fences_new_work_but_preserves_duplicate_and_control_receipts(self):
+        runtime = Runtime()
+        command = Input("user", "accepted", id="one")
+        stop = Input("stop", id="stop")
+        await runtime.submit(command)
+        await runtime.submit(stop)
+        self.assertEqual(await runtime.submit(command), "one")
+        self.assertEqual(await runtime.submit(stop), "stop")
+        with self.assertRaises(ValueError):
+            await runtime.submit(Input("user", "different", id="one"))
+        for kind, source in (("user", "user"), ("steer", "user"), ("service", "build")):
+            with self.assertRaisesRegex(RuntimeError, "stopping"):
+                await runtime.submit(Input(kind, "late", source=source, id=kind))
+            self.assertNotIn(kind, runtime.accepted)
+        await runtime.submit(Input("cancel_job", target="job"))
+
     async def test_anchored_steering_refuses_unsupported_and_stale_modes_before_acceptance(self):
         runtime = Runtime()
         await runtime.emit("generation.started", generation_id="generation", initial_input_id="root")

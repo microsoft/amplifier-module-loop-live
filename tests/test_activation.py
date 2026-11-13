@@ -486,11 +486,13 @@ async def test_native_steering_checks_input_token_not_just_producer(command_acti
     async with manager(ownership, native=True) as live:
         await live.runtime.submit(Input("user", "first", activation=first))
         await live.provider.request()
-        assert [c.text for c in live.provider.steered] == ["first"]
+        # Idle work starts a normal turn; only the bad mid-turn input below
+        # reaches native eligibility, where its own token must be checked.
+        assert live.provider.steered == []
         await live.runtime.submit(Input("steer", "MUST NOT STEER", activation=command_activation))
         with pytest.raises(RuntimeError, match="released or superseded"):
             await asyncio.wait_for(live.task, 3)
-        assert [c.text for c in live.provider.steered] == ["first"]
+        assert live.provider.steered == []
         assert live.provider.requests.empty()
 
 

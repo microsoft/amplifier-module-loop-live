@@ -34,6 +34,9 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         self.approved_dispatch = self._streaming_dispatch = ApprovedDispatch(self)
         self.runtime = None
         self.pending = deque()
+        # Context insertion is not provider handoff. Keep the FIFO barrier until
+        # the engine has prepared the request containing the drained batch.
+        self._boundary_pending = False
         self.jobs = {}
         self.load_failures = []
         self.running = False
@@ -91,6 +94,28 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     target_generation_id=command.target_generation_id, reason=reason)
         self.pending = retained
 
+    async def _hold_input(self, command, reason, generation_id=None):
+        if command.target_generation_id is not None:
+            await self.runtime.emit("steering.held", input_id=command.id,
+                target_generation_id=command.target_generation_id, reason=reason)
+        elif command.kind in {"user", "steer", "service"}:
+            generation_id = (self.runtime.generation or {}).get("id", generation_id)
+            await self.runtime.emit("input.held", input_id=command.id,
+                delivery="request_boundary" if generation_id else "new_turn",
+                **({"generation_id": generation_id} if generation_id else {}),
+                source=command.source, call_id=command.call_id, reason=reason)
+
+    async def _suspend_at_boundary(self, phase, *args, **kwargs):
+        if self.runtime and self.runtime.stop_requested:
+            raise asyncio.CancelledError
+        result = await super()._suspend_at_boundary(phase, *args, **kwargs)
+        if self.runtime and self.runtime.stop_requested:
+            raise asyncio.CancelledError
+        if phase in {"prepared_request", "prepared_finalization"}:
+            # No await between releasing the barrier and the engine dispatch.
+            self._boundary_pending = False
+        return result
+
     async def _drain_steering(self, context, hooks, iteration):
         if self.runtime is None:
             return await super()._drain_steering(context, hooks, iteration)
@@ -100,17 +125,30 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         legacy = [text for text in self._steering_queue.drain() if text != _WAKE]
         self.pending.extend(self.runtime.pending_steering)
         self.runtime.pending_steering.clear()
-        commands = list(self.pending)
-        self.pending.clear()
+        count = len(self.pending)
+        if count:
+            self._boundary_pending = True
         applied = []
-        for command in commands:
+        for _ in range(count):
+            if self.runtime.stop_requested:
+                raise asyncio.CancelledError
+            command = self.pending[0]
             if command.target_generation_id is not None and (not self.runtime.generation or self.runtime.generation["id"] != command.target_generation_id):
+                self.pending.popleft()
                 await self.runtime.emit("steering.held", input_id=command.id,
                     target_generation_id=command.target_generation_id, reason="generation-ended")
                 continue
             self._validate_input_activation(command)
             content = self.host.content(command, self.coordinator) if command.attachments else self._text(command)
-            await context.add_message({"role": "user", "content": content, "metadata": input_metadata(command)})
+            self.pending.popleft()
+            try:
+                await context.add_message({"role": "user", "content": content, "metadata": input_metadata(command)})
+            except BaseException:
+                if command.target_generation_id is None:
+                    await self.runtime.emit("input.unknown", input_id=command.id,
+                        delivery="request_boundary", source=command.source, call_id=command.call_id,
+                        reason="context-insertion-unconfirmed")
+                raise
             await self.runtime.emit("input.delivered", input_id=command.id,
                                     delivery="request_boundary", source=command.source, call_id=command.call_id,
                                     **({"target_generation_id": command.target_generation_id} if command.target_generation_id else {}))
@@ -210,6 +248,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             "mode": runtime.anchored_steering_mode, "cancellable": False,
             "submit": runtime.submit_steering})
         active = None
+        completion_deferred = False
+        failed_generation_id = None
         last = ""
         status = "error"
         idle = False
@@ -296,6 +336,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     await runtime.emit("generation.started", generation_id=str(uuid.uuid4()),
                                        initial_input_id=command.id, call_id=command.call_id)
                     active = asyncio.create_task(turn(command))
+                    completion_deferred = False
                     idle = False
                 if active is None and not self.pending and not self._active_jobs() and runtime.inbox.empty() and not idle:
                     idle = True
@@ -355,6 +396,9 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                                 await runtime.emit("command.rejected", input_id=value.id, reason="no_active_job")
                         else:
                             idle = False
+                            if runtime.stop_requested:
+                                await self._hold_input(value, "session-stopping")
+                                continue
                             if value.kind == "service":
                                 await runtime.emit("observation.received", input_id=value.id,
                                                    source=value.source, text=value.text)
@@ -367,17 +411,31 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                                     target_generation_id=value.target_generation_id, delivery="request_boundary")
                             # Multimodal updates enter through the normal Amplifier
                             # message serializer at the next request boundary.
-                            if native and not value.attachments:
+                            if (native and active is not None and not active.done()
+                                    and not value.attachments and not self.pending
+                                    and not runtime.pending_steering and not self._boundary_pending):
                                 self._validate_input_activation(value)
-                                if await native.steer_live(value):
+                                try:
+                                    native_owned = await native.steer_live(value)
+                                    if native_owned is not True and native_owned is not False:
+                                        raise RuntimeError("Native steering returned no definitive ownership disposition")
+                                except BaseException:
+                                    await runtime.emit("input.unknown", input_id=value.id,
+                                        delivery="native", source=value.source, call_id=value.call_id,
+                                        reason="native-injection-unconfirmed")
+                                    raise
+                                if native_owned:
                                     continue
                             self.pending.append(value)
                             self.steer(_WAKE)
-                            await runtime.emit("input.queued", input_id=value.id, delivery="request_boundary")
+                            await runtime.emit("input.queued", input_id=value.id,
+                                delivery="request_boundary" if active is not None else "new_turn",
+                                source=value.source, call_id=value.call_id)
                     elif kind == "bundle_turn":
                         await active
                         result, error = value
                         if error:
+                            failed_generation_id = runtime.generation["id"]
                             runtime.steering_closed = True
                             active = None
                             await self._hold_anchored("generation-failed")
@@ -388,16 +446,28 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                             raise ManagerTurnError(failure) from cause
                         last = result or last
                         checkpoint = coordinator.get_capability("live.checkpoint")
-                        if checkpoint:
+                        if checkpoint and not completion_deferred:
                             await checkpoint()
+                        if runtime.stop_requested:
+                            status = "cancelled"
+                            break
+                        if runtime.queued_inputs and not completion_deferred:
+                            # Only defer this completion for accepted inbox input,
+                            # once: never extend it indefinitely for new callbacks.
+                            # Preserve the inputs and their producer identities.
+                            completion_deferred = True
+                            runtime.inbox.put_nowait(event)
+                            continue
                         # Accepted input can arrive during the final response or
                         # its checkpoint. Keep the same generation alive for it;
                         # never replay the previous prompt or completed tools.
                         pending = [command for command in [*self.pending, *runtime.pending_steering]
-                                   if command.target_generation_id == runtime.generation['id']]
+                                   if command.target_generation_id == runtime.generation['id']
+                                   or (command.target_generation_id is None and command.kind in {"user", "steer"})]
                         if (pending and not runtime.stop_requested
                                 and not coordinator.cancellation.is_cancelled and not self._budget_exhausted):
                             active = asyncio.create_task(turn(pending[0], continuation=True))
+                            completion_deferred = False
                             continue
                         # No await between the empty-queue decision and closing
                         # admission. Later submissions fail before being accepted.
@@ -437,8 +507,9 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 active.cancel()
                 await asyncio.gather(active, return_exceptions=True)
             await self._hold_anchored("session-closing")
-            if active:
-                await runtime.emit("generation.detached", cancellation="unconfirmed")
+            while self.pending:
+                await self._hold_input(self.pending.popleft(), "session-closing", failed_generation_id)
+            self._boundary_pending = False
             for job in self.jobs.values():
                 if not job["task"].done():
                     job["task"].cancel()
@@ -450,15 +521,15 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 kind, value = runtime.inbox.get_nowait()
                 if kind == "input":
                     runtime.queued_inputs -= 1
-                    if value.target_generation_id is not None:
-                        await runtime.emit("steering.held", input_id=value.id,
-                            target_generation_id=value.target_generation_id, reason="session-closing")
+                    await self._hold_input(value, "session-closing", failed_generation_id)
                 elif kind == "bundle_job":
                     await self._job_returned(*value, deliver=False)
                 elif kind == "child_event":
                     await runtime.emit("child.updated", **value)
                 elif kind == "bundle_persistence_error":
                     await runtime.emit("persistence.failed", error_type=value)
+            if active:
+                await runtime.emit("generation.detached", cancellation="unconfirmed")
             for identity, outcome in list(runtime.steering_outcomes.items()):
                 if outcome["disposition"] == "queued":
                     await runtime.emit("steering.unknown", input_id=identity,
