@@ -354,7 +354,9 @@ async def test_rejection_observer_failure_does_not_replace_activation_error():
             ownership.bound.reset(bound)
         with pytest.raises(RuntimeError, match="exact activation failure") as failure:
             await asyncio.wait_for(live.task, 3)
-        assert failure.value is original
+        # Core versions may wrap execute failures; the exact bind exception
+        # must remain the causal error, never the observer's ValueError.
+        assert failure.value is original or failure.value.__cause__ is original
         assert original.__notes__ == ["Callback rejection observation failed: ValueError"]
         assert any(event["type"] == "command.rejected" and event["child_session_id"] == "child"
                    and event["call_id"] == "call" for event in live.runtime.events)
