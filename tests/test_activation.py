@@ -50,7 +50,7 @@ class Ownership:
 
 
 @asynccontextmanager
-async def manager(ownership, park=None, *, native=False):
+async def manager(ownership, park=None, *, native=False, errors=None):
     runtime = Runtime()
     runtime.capture_activation = ownership.current
     session = AmplifierSession({"session": {
@@ -84,6 +84,18 @@ async def manager(ownership, park=None, *, native=False):
     for name, capability in {"live.runtime": runtime, "live.activation": ownership,
                              "live.park": park, "live.checkpoint": checkpoint}.items():
         session.coordinator.register_capability(name, capability)
+    if errors is not None:
+        loop = session.coordinator.get("orchestrator")
+        execute = loop.execute
+
+        async def capture(*args, **kwargs):
+            try:
+                return await execute(*args, **kwargs)
+            except Exception as exc:
+                errors.append(exc)
+                raise
+
+        loop.execute = capture
     task = asyncio.create_task(session.execute(""))
     try:
         await runtime.wait_for(lambda event: event["type"] == "session.ready", 3)
@@ -332,7 +344,8 @@ async def test_effectful_callback_after_release_cannot_borrow_new_owner(kind, pa
 async def test_rejection_observer_failure_does_not_replace_activation_error():
     ownership = Ownership()
     first = ownership.activate()
-    async with manager(ownership) as live:
+    errors = []
+    async with manager(ownership, errors=errors) as live:
         original = RuntimeError("exact activation failure")
         bind = ownership.bind
 
@@ -354,9 +367,9 @@ async def test_rejection_observer_failure_does_not_replace_activation_error():
             ownership.bound.reset(bound)
         with pytest.raises(RuntimeError, match="exact activation failure") as failure:
             await asyncio.wait_for(live.task, 3)
-        # Core versions may wrap execute failures; the exact bind exception
-        # must remain the causal error, never the observer's ValueError.
-        assert failure.value is original or failure.value.__cause__ is original
+        # Inspect the portable boundary: Core versions may wrap execute
+        # failures without retaining Python exception chaining.
+        assert errors == [original]
         assert original.__notes__ == ["Callback rejection observation failed: ValueError"]
         assert any(event["type"] == "command.rejected" and event["child_session_id"] == "child"
                    and event["call_id"] == "call" for event in live.runtime.events)
