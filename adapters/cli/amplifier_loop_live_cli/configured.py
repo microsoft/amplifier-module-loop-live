@@ -284,8 +284,24 @@ async def prepare_manager(workspace, *, runtime=None, bundle=None, background_de
             recovered = []
         from .provider_imports import prepare_openai_import
         await prepare_openai_import(prepared, plan)
+        from amplifier_app_cli.session_checkpoint import install_session_checkpoint
+        from amplifier_app_cli.session_media import install_session_media
+        from amplifier_app_cli.session_hooks import (
+            install_session_hook_graph, session_hook_coordinator, configure_session_hook_graph,
+        )
+        construction = None
+        async def before_initialize(candidate):
+            nonlocal session, construction
+            # Retain the real construction immediately so setup failure can
+            # release its media owner even before create_session returns.
+            session = candidate
+            construction = install_session_hook_graph(candidate, owner="cli.configured_live",
+                host_participants=("host.media", "host.loop-live", "host.child_observers"))
+            install_session_checkpoint(candidate, store, session_id=runtime.session_id, bundle=bundle)
+            install_session_media(candidate, store, restored_messages=transcript)
         session = await prepared.create_session(session_id=runtime.session_id, session_cwd=workspace,
-            approval_system=approvals, display_system=CLIDisplaySystem(), is_resumed=transcript is not None)
+            approval_system=approvals, display_system=CLIDisplaySystem(), is_resumed=transcript is not None,
+            before_initialize=before_initialize)
         if transcript is not None:
             await session.coordinator.get("context").set_messages(mark_interrupted_receipts(transcript))
         from .host_adapter import CLIHostAdapter
@@ -301,11 +317,15 @@ async def prepare_manager(workspace, *, runtime=None, bundle=None, background_de
         register = session.coordinator.get_capability("approval.register_provider")
         if register:
             register(approvals)
-        configurator = SessionConfigurator(session, prepared)
-        await configurator.apply_saved_settings(settings.get_merged_settings().get("configurator") or {})
-        configurator.take_snapshot()
-        from amplifier_loop_live_cli.bundle_astra import install
-        native_providers = await install(session.coordinator)
+        # Saved configuration and actual native/child adapters belong to the
+        # initial construction. Do not mutate or replace a sealed source graph.
+        with configure_session_hook_graph(session):
+            configurator = SessionConfigurator(session, prepared,
+                coordinator=session_hook_coordinator(session, "host.configurator"))
+            await configurator.apply_saved_settings(settings.get_merged_settings().get("configurator") or {})
+            configurator.take_snapshot()
+            from amplifier_loop_live_cli.bundle_astra import install
+            native_providers = await install(session_hook_coordinator(session, "host.loop-live"))
         if pin_provider:
             session.coordinator.get_capability("conversation.provider_pin").pin(pin_provider)
         from amplifier_loop_live_cli.selection import select_root
@@ -321,7 +341,7 @@ async def prepare_manager(workspace, *, runtime=None, bundle=None, background_de
         loop = session.coordinator.get("orchestrator")
         from amplifier_loop_live_cli.children import install as install_children
         from amplifier_loop_live_cli.worker_settings import WorkerSettings
-        await install_children(session.coordinator, runtime,
+        await install_children(session_hook_coordinator(session, "host.loop-live"), runtime,
             settings=WorkerSettings(worker_settings,{row["id"]:row["provider"] for row in provider_choices}))
         selected_provider = loop._select_provider(session.coordinator.get("providers"))
         effective_selection = root_selection or next(({k:row.get(k) for k in ("provider","model","effort")} | {"instance":row["id"]}

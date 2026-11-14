@@ -219,7 +219,8 @@ async def test_public_positive_background_result_checkpoint_and_private_send(tmp
 
 @pytest.mark.parametrize("format", ["PNG", "JPEG"])
 @pytest.mark.parametrize("scope", ["root", "child"])
-async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_path, monkeypatch, format, scope):
+@pytest.mark.parametrize("construction", ["declared-components", "actual-cli-installer"])
+async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_path, monkeypatch, format, scope, construction):
     """Actual live engine path, with explicitly owned late execution callbacks."""
     from amplifier_core.message_models import ChatResponse, TextBlock
     from amplifier_module_loop_live.runtime import Input
@@ -231,13 +232,23 @@ async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_pa
     session = AmplifierSession(config, parent_id=parent_id)
     owner = session.coordinator
     bridge = bridge_module.install_media_hook_bridge(owner)
-    graph = bridge.begin_participating_graph(session, owner="offline.live.manager.cli-components",
-        participants=("loop-live", "context-simple", "tool-offline-live-positive",
-                      "host.media", "host.execution"))
-    view = graph.participant("host.execution")
+    cli_graph = None
+    if construction == "actual-cli-installer":
+        from amplifier_app_cli.session_hooks import install_session_hook_graph
+        cli_graph = install_session_hook_graph(session, owner="offline.actual-cli.live-installer",
+                                               host_participants=("host.media",))
+        if not callable(owner.get_capability("cli.media.execution_registration")):
+            pytest.skip("Requires current actual CLI late-registration capability")
+        graph = cli_graph.construction
+        view = cli_graph.coordinator("host.loop-live")
+    else:
+        graph = bridge.begin_participating_graph(session, owner="offline.live.manager.cli-components",
+            participants=("loop-live", "context-simple", "tool-offline-live-positive",
+                          "host.media", "host.execution"))
+        view = graph.participant("host.execution")
     native = SessionStore(tmp_path / "sessions")
-    host = install_session_media(SimpleNamespace(session_id=session.session_id, config=session.config,
-                                                coordinator=graph.participant("host.media")), native)
+    host = install_session_media(session if cli_graph else SimpleNamespace(
+        session_id=session.session_id, config=session.config, coordinator=graph.participant("host.media")), native)
     install_session_checkpoint(session, native, session_id=session.session_id)
     ledger = JobStore(tmp_path / "jobs")
     pixels = image_bytes(format)
@@ -251,6 +262,12 @@ async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_pa
             return {"v": 1, "positions": ["tool"]}
         async def request_budget(self, request, *, context_estimate=None, request_options=None):
             host.capability.validate(request, purpose="count", request_options=request_options)
+            if cli_graph:
+                # Exercise the actual issuer fence while the CLI-installed F1
+                # wrapper holds the private count/send candidate, not a flag.
+                with pytest.raises(ValueError, match="active leases"):
+                    with cli_graph.transition():
+                        raise AssertionError("counted candidate must fence graph changes")
             self.counted = request
             return {"estimated_input_tokens": 10, "input_limit_tokens": 10000,
                     "context_token_budget": 10000, "measurement": {
@@ -290,14 +307,14 @@ async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_pa
         if event["type"] == "session.ready":
             # The late CLI diagnostics and actual live-manager observers have
             # registered. A host-owned observed phase seals before work input.
-            receipts.append(graph.seal())
+            receipts.append(bridge.graph_receipt if cli_graph else graph.seal())
     runtime = Runtime(observer=status)
     owner.register_capability("live.runtime", runtime)
     owner.register_capability("live.host", CLIHostAdapter())
     owner.register_capability("live.jobs", ledger)
     await view.mount("providers", Selected(), name="account")
-    task = asyncio.create_task(loop.execute("", context, owner.get("providers"), owner.get("tools"),
-                                           view.hooks, view))
+    task = asyncio.create_task(session.execute("") if cli_graph else loop.execute(
+        "", context, owner.get("providers"), owner.get("tools"), view.hooks, view))
     try:
         await runtime.wait_for(lambda event: event["type"] == "session.ready", 3)
         assert len(receipts) == 1 and bridge.validate_receipt(receipts[0]), (
@@ -339,12 +356,19 @@ async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_pa
         # is inherited and the reconciled job must not execute again.
         session = AmplifierSession(config, session_id=session.session_id, parent_id=parent_id)
         owner = session.coordinator
-        graph = graph.reconstruct(session, participants=graph.participants)
-        bridge = owner.get_capability("session.media.tool_post")
+        if cli_graph:
+            cli_graph = install_session_hook_graph(session, owner="offline.actual-cli.live-installer",
+                                                   host_participants=("host.media",))
+            graph = cli_graph.construction
+            bridge = owner.get_capability("session.media.tool_post")
+        else:
+            graph = graph.reconstruct(session, participants=graph.participants)
+            bridge = owner.get_capability("session.media.tool_post")
         assert not bridge.validate_receipt(old_receipt)
-        view = graph.participant("host.execution")
-        host = install_session_media(SimpleNamespace(session_id=session.session_id, config=session.config,
-            coordinator=graph.participant("host.media")), native, restored_messages=saved_rows)
+        view = cli_graph.coordinator("host.loop-live") if cli_graph else graph.participant("host.execution")
+        host = install_session_media(session if cli_graph else SimpleNamespace(
+            session_id=session.session_id, config=session.config, coordinator=graph.participant("host.media")),
+            native, restored_messages=saved_rows)
         install_session_checkpoint(session, native, session_id=session.session_id)
         await session.initialize()
         loop, context = owner.get("orchestrator"), owner.get("context")
@@ -357,8 +381,8 @@ async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_pa
         owner.register_capability("live.jobs", ledger)
         await view.mount("providers", Selected(), name="account")
         image_sent.clear()
-        task = asyncio.create_task(loop.execute("", context, owner.get("providers"), owner.get("tools"),
-                                               view.hooks, view))
+        task = asyncio.create_task(session.execute("") if cli_graph else loop.execute(
+            "", context, owner.get("providers"), owner.get("tools"), view.hooks, view))
         await runtime.wait_for(lambda event: event["type"] == "session.ready", 3)
         await runtime.submit(Input("user", "resume saved image", id="resumed-input"))
         await asyncio.wait_for(image_sent.wait(), 3)
