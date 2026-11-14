@@ -51,5 +51,6 @@ jobs:
         with:
           name: candidate-${{ matrix.lane }}-${{ matrix.os }}-py${{ matrix.python }}
           path: ${{ runner.temp }}/exact-live-candidate/evidence
+          include-hidden-files: true # uv's generated wheels/.gitignore is in hashes.json
           if-no-files-found: error
           retention-days: 30

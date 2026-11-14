@@ -460,7 +460,7 @@ def driver():
         raise
     finally:
         # Snapshot first, then write: the manifest never includes itself.
-        hashes = {str(p.relative_to(out)): digest(p.read_bytes())
+        hashes = {p.relative_to(out).as_posix(): digest(p.read_bytes())
                   for p in sorted(out.rglob("*")) if p.is_file() and p.name != "hashes.json"}
         save(out / "hashes.json", hashes)
 
