@@ -121,3 +121,40 @@ def test_optional_provider_methods_are_only_callable_when_original_supports_them
     if callable(exposed):
         # Optional request consumers now apply selection before projection.
         assert exposed(ChatRequest(messages=[])) == "original"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapted", [False, True])
+async def test_install_native_selected_replacements_use_actual_adapter_edges(ordinary_adapter, monkeypatch, adapted):
+    adapter, provider_class = ordinary_adapter
+    class ChatGPT:
+        pass
+    package = ModuleType("amplifier_module_provider_openai_chatgpt")
+    package.ChatGPTProvider = ChatGPT
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    consultation = ModuleType("amplifier_loop_live_cli.consultation_images")
+    class ImageChatGPT(ChatGPT):
+        @classmethod
+        def wrap(cls, original):
+            result = cls()
+            result.original = original
+            return result
+    consultation.ImageChatGPTProvider = ImageChatGPT
+    monkeypatch.setitem(sys.modules, consultation.__name__, consultation)
+    original, chat = provider_class(), ChatGPT()
+    providers, edges = {"openai": original, "chat": chat}, []
+    async def mount(kind, module, *, name):
+        edges.append((name, None, module))
+        providers[name] = module
+    async def mount_adapter(kind, module, *, previous, name):
+        assert providers[name] is previous
+        edges.append((name, previous, module))
+        providers[name] = module
+    owner = SimpleNamespace(get=lambda kind: providers, mount=mount)
+    if adapted:
+        owner.mount_adapter = mount_adapter
+    assert await adapter.install(owner) == []  # No optional native runtime in this fixture.
+    assert [name for name, *_ in edges] == ["openai", "chat"]
+    assert [previous for _, previous, _ in edges] == ([original, chat] if adapted else [None, None])
+    assert isinstance(providers["openai"], adapter.SafeOpenAIProvider)
+    assert isinstance(providers["chat"], ImageChatGPT)

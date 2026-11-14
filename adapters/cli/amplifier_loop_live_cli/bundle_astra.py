@@ -87,11 +87,19 @@ async def install(coordinator, native=True):
     from amplifier_loop_live_cli.consultation_images import ImageChatGPTProvider
     from amplifier_module_provider_openai_chatgpt import ChatGPTProvider
     installed = []
+    adapter_mount = getattr(coordinator, "mount_adapter", None)
     for name, provider in (coordinator.get("providers") or {}).items():
         if type(provider) is OpenAIProvider:
             wrapped = (BundleAstraProvider if native and provider.default_model == "gpt-6-astra" and "complete" not in provider.__dict__ else SafeOpenAIProvider).wrap(provider)
-            await coordinator.mount("providers", wrapped, name=name)
+            if callable(adapter_mount):
+                await adapter_mount("providers", wrapped, previous=provider, name=name)
+            else:
+                await coordinator.mount("providers", wrapped, name=name)
             if isinstance(wrapped,BundleAstraProvider):installed.append(name)
         elif type(provider) is ChatGPTProvider:
-            await coordinator.mount("providers", ImageChatGPTProvider.wrap(provider), name=name)
+            wrapped = ImageChatGPTProvider.wrap(provider)
+            if callable(adapter_mount):
+                await adapter_mount("providers", wrapped, previous=provider, name=name)
+            else:
+                await coordinator.mount("providers", wrapped, name=name)
     return installed
