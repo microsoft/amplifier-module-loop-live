@@ -252,6 +252,7 @@ def test_stream_request_support_is_forwarded_only_from_actual_provider_with_sele
     def support(*, model, request_options=None):
         observed.append((model, request_options))
         return {"v": 1, "tools": "chat_request"}
+    driver.stream = AsyncMock()
     driver.get_stream_request_support = support
     view = RootProvider(driver, selection(), "fixture")
     assert view.get_stream_request_support(model="ignored", request_options={"temperature": 0.3}) == {

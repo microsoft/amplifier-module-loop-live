@@ -25,6 +25,7 @@ from amplifier_core.message_models import ChatRequest, ImageBlock, Message, Tool
 from amplifier_loop_live_cli.host_adapter import CLIHostAdapter
 from amplifier_module_loop_live.job_store import JobStore
 from amplifier_module_loop_live.runtime import Runtime
+from amplifier_module_loop_streaming.media import UNAVAILABLE
 from test_cli_media_provider import Provider, no_network  # noqa: F401
 from amplifier_loop_live_cli.selection import RootProvider
 from amplifier_loop_live_cli.worker_settings import ObservedWorkerProvider
@@ -67,7 +68,11 @@ async def test_actual_engine_counts_and_dispatches_through_cli_neutral_factory(t
             return ChatResponse(content=[TextBlock(text="done")])
     driver = Selected()
     if streaming:
+        # This local fixture is the actual owner of its public stream method.
+        # Reviewed production vendors have complete(), not this optional route.
+        driver.get_stream_request_support = lambda **kwargs: {"v": 1, "tools": "chat_request"}
         async def stream(request, **kwargs):
+            assert "tools" not in kwargs
             host.capability.validate(request, purpose="transport", request_options=kwargs)
             observed.append(("send", id(request)))
             yield {"content": "done"}
@@ -231,12 +236,15 @@ async def test_actual_guarded_bridge_never_admits_live_background_media_or_repla
             job_id, job = next(iter(loop.jobs.items()))
             await job["task"]
         assert counts == {"tool": 1, "post": 1, "process": 1}
-        # Streaming's existing safety net returns an explicit error carrier;
-        # "returned" means a report arrived, not that media/tool work succeeded.
+        # A returned report is not bridge/media acceptance. The guarded current
+        # route preserves explicit null, otherwise freezes unavailable text.
         assert ledger.rows["call"]["status"] == "returned"
         record = ledger.rows["call"]["settled_result"]
-        assert "Media tool post boundary failed; no media was accepted" in record["content"]
-        assert record["metadata"] == {} and record["success"] is not True
+        if mode == "null":
+            assert record["content"] == "null" and record["result"] is None
+        else:
+            assert UNAVAILABLE in record["content"]
+        assert record["metadata"] == {}
         kind, args = loop.runtime.inbox.get_nowait()
         assert kind == "bundle_job"
         await loop._job_returned(*args, deliver=True)
