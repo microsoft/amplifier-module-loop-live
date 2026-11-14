@@ -491,3 +491,117 @@ async def test_actual_cli_raw_finite_child_and_cold_resume_use_fresh_media_owner
     finally:
         HOST_ADAPTER.reset(token)
         await parent.cleanup()
+
+
+@pytest.mark.parametrize("format", ["PNG", "JPEG"])
+@pytest.mark.parametrize("wrapper", ["root", "worker"])
+@pytest.mark.parametrize("abandonment", ["manual", "engine-refusal", "engine-cancel", "engine-suspend"])
+async def test_selected_public_release_ends_actual_graph_lease_without_transport(tmp_path, format, wrapper, abandonment):
+    from amplifier_core import ProviderInfo
+    from amplifier_app_cli.session_hooks import install_session_hook_graph
+    from amplifier_loop_live_cli.selection import RootProvider
+    from amplifier_loop_live_cli.worker_settings import ObservedWorkerProvider
+    session = AmplifierSession({"session": {"orchestrator": "loop-live", "context": "context-simple"},
+                                "providers": [], "session_media": POLICY})
+    cli_graph = install_session_hook_graph(session, owner="offline.live.selected-release",
+                                           host_participants=("host.media",))
+    host = install_session_media(session, SessionStore(tmp_path / "sessions"))
+    await session.initialize()
+    owner, calls = session.coordinator, []
+    context = owner.get("context")
+    install_session_checkpoint(session, host.native, session_id=session.session_id)
+    payload = image_bytes(format)
+    origin = {"kind": "upload", "session_id": session.session_id, "id": "release-upload"}
+    ref = (await host.capability.ingest(payload, source_format="image-bytes", origin=origin, policy=None))["value"]
+    await host.capability.publish([ref], origin=origin, disposition="retain")
+    rows = [{"role": "user", "content": "selected reference", "metadata": {MEDIA: {"refs": [ref]}}}]
+    await context.set_messages(rows)
+    await owner.get_capability("session.durable_checkpoint")()
+    saved_canonical = await context.get_messages()
+    class Counted(Provider):
+        def get_info(self):
+            return ProviderInfo(id="fixture", display_name="Offline", capabilities=[],
+                                defaults={"model": "fixture"})
+        def get_media_request_support(self, **kwargs):
+            return {"v": 1, "positions": ["user"]}
+        async def request_budget(self, request, **kwargs):
+            calls.append("count")
+            self.counted = request
+            assert any(isinstance(block, ImageBlock) for message in request.messages
+                       for block in message.content if isinstance(message.content, list))
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 10000,
+                    "context_token_budget": 10000, "measurement": {
+                        "kind": "provider_count", "source": "offline synthetic owner", "input_tokens": 10}}
+        async def complete(self, request, **kwargs):
+            calls.append("send")
+            assert request is self.counted
+            return "done"
+    driver = Counted()
+    await cli_graph.coordinator("host.media").mount("providers", driver, name="account")
+    if wrapper == "root":
+        raw = RootProvider(driver, {"instance": "account", "model": "selected-model",
+                                   "effort": "high", "thinkingBudget": None}, "fixture")
+    else:
+        raw = ObservedWorkerProvider(driver, {"account": driver},
+                                     SimpleNamespace(configuration=lambda *args: None), "child")
+    view = CLIHostAdapter().prepare_provider(raw, owner)
+    cli_graph.seal()
+    bridge = owner.get_capability("session.media.tool_post")
+    receipt = bridge.graph_receipt
+    canonical, options = ChatRequest(messages=[Message(**row) for row in rows]), {"temperature": 0.25}
+    try:
+        if abandonment != "manual":
+            from amplifier_module_loop_streaming.suspension import ExecutionSuspended
+            loop = owner.get("orchestrator")
+            loop.root_provider = raw
+            owner.register_capability("live.host", CLIHostAdapter())
+            boundary_calls = []
+            async def stop_after_fit(phase, *args, **kwargs):
+                if phase != "prepared_request":
+                    return
+                boundary_calls.append(phase)
+                assert calls and calls[-1] == "count"
+                if abandonment == "engine-cancel":
+                    raise asyncio.CancelledError
+                if abandonment == "engine-suspend":
+                    raise ExecutionSuspended({"fixture": "prepared boundary held"})
+                raise RuntimeError("fixture local refusal after fitting")
+            loop._suspend_at_boundary = stop_after_fit
+            expected_error = (asyncio.CancelledError if abandonment == "engine-cancel" else
+                              ExecutionSuspended if abandonment == "engine-suspend" else RuntimeError)
+            with pytest.raises(expected_error):
+                await loop.execute("inspect saved refs", context, owner.get("providers"), owner.get("tools"),
+                                   owner.hooks, owner)
+            assert boundary_calls == ["prepared_request"] and "send" not in calls
+            prepared = host.wrappers[id(driver)][1]
+            assert prepared._candidate is None and prepared._active == [] and prepared._lifetimes == []
+            # Actual engine cleanup, through selected wrappers, lifted the
+            # issuer lease without closing/rebuilding the shared provider.
+            with cli_graph.transition():
+                pass
+            assert bridge.validate_receipt(bridge.graph_receipt)
+            return
+        await view.request_budget(canonical, request_options=options)
+        with pytest.raises(ValueError, match="active leases"):
+            with cli_graph.transition():
+                raise AssertionError("must remain fenced until exact release")
+        assert view.release_media_request(canonical.model_copy(deep=True), request_options=options) is False
+        assert bridge.validate_receipt(receipt)
+        canonical.messages[0].content = "caller mutated after fitting"
+        if wrapper == "root":
+            view.selection = {**view.selection, "model": "later-model", "effort": "low"}
+        assert view.release_media_request(canonical, request_options=options) is True
+        assert view.release_media_request(canonical, request_options=options) is False
+        assert calls == ["count"]
+        with cli_graph.transition():
+            pass
+        assert not bridge.validate_receipt(receipt) and bridge.validate_receipt(bridge.graph_receipt)
+        assert await context.get_messages() == saved_canonical  # Private caller object alone changed.
+        assert host.native.load(session.session_id)[0] == saved_canonical
+        # The same selected wrapper can prepare a new current-generation request.
+        fresh = ChatRequest(messages=[Message(**row) for row in rows])
+        await view.request_budget(fresh, request_options=options)
+        assert await view.complete(fresh, **options) == "done"
+        assert calls == ["count", "count", "send"]
+    finally:
+        await session.cleanup()
