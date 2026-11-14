@@ -495,7 +495,8 @@ async def test_actual_cli_raw_finite_child_and_cold_resume_use_fresh_media_owner
 
 @pytest.mark.parametrize("format", ["PNG", "JPEG"])
 @pytest.mark.parametrize("wrapper", ["root", "worker"])
-@pytest.mark.parametrize("abandonment", ["manual", "engine-refusal", "engine-cancel", "engine-suspend"])
+@pytest.mark.parametrize("abandonment", ["manual", "engine-refusal", "engine-cancel", "engine-suspend",
+                                       "nested-refusal", "nested-revoke", "nested-cancel", "nested-hold"])
 async def test_selected_public_release_ends_actual_graph_lease_without_transport(tmp_path, format, wrapper, abandonment):
     from amplifier_core import ProviderInfo
     from amplifier_app_cli.session_hooks import install_session_hook_graph
@@ -518,6 +519,8 @@ async def test_selected_public_release_ends_actual_graph_lease_without_transport
     await context.set_messages(rows)
     await owner.get_capability("session.durable_checkpoint")()
     saved_canonical = await context.get_messages()
+    nested = abandonment.startswith("nested-")
+    state = {"valid": True, "held": False}
     class Counted(Provider):
         def get_info(self):
             return ProviderInfo(id="fixture", display_name="Offline", capabilities=[],
@@ -527,9 +530,19 @@ async def test_selected_public_release_ends_actual_graph_lease_without_transport
         async def request_budget(self, request, **kwargs):
             calls.append("count")
             self.counted = request
-            assert any(isinstance(block, ImageBlock) for message in request.messages
-                       for block in message.content if isinstance(message.content, list))
-            return {"estimated_input_tokens": 10, "input_limit_tokens": 10000,
+            has_image = any(isinstance(block, ImageBlock) for message in request.messages
+                            for block in message.content if isinstance(message.content, list))
+            # Public nested model.complete is deliberately text-only. It still
+            # owns the exact F1 request association/graph lease after counting.
+            assert has_image is not nested
+            if abandonment == "nested-revoke":
+                state["valid"] = False
+            if abandonment == "nested-cancel":
+                owner.cancellation.request_immediate()
+            if abandonment == "nested-hold":
+                state["held"] = True
+            return {"estimated_input_tokens": 10,
+                    "input_limit_tokens": 1 if abandonment == "nested-refusal" else 10000,
                     "context_token_budget": 10000, "measurement": {
                         "kind": "provider_count", "source": "offline synthetic owner", "input_tokens": 10}}
         async def complete(self, request, **kwargs):
@@ -545,11 +558,37 @@ async def test_selected_public_release_ends_actual_graph_lease_without_transport
         raw = ObservedWorkerProvider(driver, {"account": driver},
                                      SimpleNamespace(configuration=lambda *args: None), "child")
     view = CLIHostAdapter().prepare_provider(raw, owner)
+    if nested:
+        owner.register_capability("execution.suspension", SimpleNamespace(requested=lambda: state["held"]))
     cli_graph.seal()
     bridge = owner.get_capability("session.media.tool_post")
     receipt = bridge.graph_receipt
     canonical, options = ChatRequest(messages=[Message(**row) for row in rows]), {"temperature": 0.25}
     try:
+        if nested:
+            from amplifier_module_loop_streaming.suspension import NestedExecutionHeld
+            loop = owner.get("orchestrator")
+            loop.root_provider = view
+            loop.config["programmatic_dispatch"] = True
+            dispatcher = loop.approved_dispatch
+            dispatcher.validate_context = lambda coordinator: state["valid"]
+            expected = NestedExecutionHeld if abandonment == "nested-hold" else RuntimeError
+            with dispatcher.run_scope(owner):
+                with dispatcher.call_scope(ToolCall(id="nested-parent", name="tool_exec", arguments={}),
+                                           {}, owner.hooks, None):
+                    with pytest.raises(expected):
+                        await dispatcher.complete(canonical)
+            assert calls == ["count"]
+            prepared = host.wrappers[id(driver)][1]
+            assert prepared._candidate is None and prepared._active == [] and prepared._lifetimes == []
+            # Cleanup occurs before ordinary session teardown, without transport
+            # or closing a shared provider. The canonical image rows stay intact.
+            assert await context.get_messages() == saved_canonical
+            assert host.native.load(session.session_id)[0] == saved_canonical
+            with cli_graph.transition():
+                pass
+            assert not bridge.validate_receipt(receipt) and bridge.validate_receipt(bridge.graph_receipt)
+            return
         if abandonment != "manual":
             from amplifier_module_loop_streaming.suspension import ExecutionSuspended
             loop = owner.get("orchestrator")
