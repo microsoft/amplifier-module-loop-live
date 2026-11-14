@@ -123,6 +123,37 @@ ownership. The lock file is never truncated, replaced or unlinked. Saved records
 are explicitly UTF-8. Pending work after process loss remains uncertain and is
 never automatically replayed.
 
+With a compatible loop-streaming, a completed background job also retains its
+explicit, reference-only `SettledToolResult`. Version-2 job records bind that
+carrier to the original call/name and fingerprint; version-1 text records remain
+readable without parsing report strings as JSON. Recovery checks both text and
+settled metadata, including every duplicate output, and refuses conflicting
+evidence rather than overwriting it.
+
+`live_job` read/wait pages slice only `report` text. The separate
+`result_metadata` and `result_fingerprint` fields retain the original job's
+evidence independently of the page offset; list remains summary-only. These
+fields do not give the new control call ownership of the original media.
+Service inputs keep job evidence nested under `live_job_result` with service
+provenance. Only the matching original tool row receives media metadata during
+receipt synchronization. That replacement requires the host's
+`session.durable_checkpoint` before another provider dispatch; the media owner
+must independently validate the exact save acknowledgment before hydration.
+Neither a ledger write nor a service notice establishes a canonical media commit.
+Native service shortcuts are bypassed for structured job evidence so they cannot
+discard that provenance. Native image transport, provider preparation, storage
+authorization, and pixel removal still require their independently qualified
+owners; streaming inheritance or a saved reference is not proof of vision.
+
+The host's `live.attachments.encode(command, coordinator)` may return legacy
+content directly or asynchronously return an explicit `{"content": ...,
+"metadata": {...}}` mapping. Both initial-turn and request-boundary attachment
+delivery retain the mapping's metadata alongside the admitted `amplifier_input`
+identity and unrelated owner namespaces. Conflicting provenance is refused, not
+overwritten. Ref-bearing attachments are checkpointed after canonical append
+through loop-streaming's shared `checkpoint_settled_results` helper and before
+the engine can count or dispatch; encoding never hydrates media in the loop.
+
 The host must supply a trusted private storage location. On POSIX, new directories
 and files request modes `0700` and `0600`; existing storage is not repaired. On
 Windows, these mode bits do **not** supply private ACLs. The host must establish

@@ -7,23 +7,28 @@ extension supplies native steering and async delegate calls when selected.
 """
 
 import asyncio
+import copy
 import json
 import uuid
 from collections import deque
+from contextlib import ExitStack
 from contextvars import ContextVar
 
 from amplifier_core import HookResult
-from amplifier_module_loop_streaming import StreamingOrchestrator, ConversationProviderPin
+from amplifier_module_loop_streaming import (StreamingOrchestrator, ConversationProviderPin,
+                                             SettledToolResult)
 from .runtime import Input, observation
 from .provenance import InputContext, ContinuationContext, input_metadata
-from .job_store import serialize_result
-from .host import HostAdapter, AttachmentContext
+from .job_store import apply_result, result_fields, settled_record
+from .host import (HostAdapter, AttachmentContext, attachment_content,
+                   attachment_message, checkpoint_attachment)
 from .scope import HOST_ADAPTER
 from .failures import ManagerTurnError, turn_failure
 from .dispatch import ApprovedDispatch
 
 _WAKE = "[loop-live inbox wake]"
 _GOAL_SCOPE = ContextVar("live_goal_scope", default=None)
+_PROVIDER_VIEWS = ContextVar("live_provider_views", default=None)
 
 
 class BundleLiveOrchestrator(StreamingOrchestrator):
@@ -38,6 +43,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         # the engine has prepared the request containing the drained batch.
         self._boundary_pending = False
         self.jobs = {}
+        self._job_media_checkpointed = set()
+        self._job_media_checkpoint_pending = set()
         self.load_failures = []
         self.running = False
         self.root_provider = None
@@ -74,6 +81,11 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         return result
 
     def _select_provider(self, providers):
+        views = _PROVIDER_VIEWS.get()
+        if views:
+            providers = {name: views[id(provider)][1]
+                         if id(provider) in views and views[id(provider)][0] is provider else provider
+                         for name, provider in providers.items()}
         return self.root_provider or super()._select_provider(providers)
 
     def _validate_input_activation(self, command):
@@ -139,10 +151,20 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     target_generation_id=command.target_generation_id, reason="generation-ended")
                 continue
             self._validate_input_activation(command)
-            content = self.host.content(command, self.coordinator) if command.attachments else self._text(command)
+            message = {"role": "user", "content": self._text(command), "metadata": input_metadata(command)}
+            if command.attachments:
+                encoded = await attachment_content(self.host, command, self.coordinator)
+                message = attachment_message(message, encoded)
+                # Encoding can await host storage. Do not admit an input under
+                # an expired activation or after Stop won during that await.
+                if self.runtime.stop_requested:
+                    raise asyncio.CancelledError
+                self._validate_input_activation(command)
             self.pending.popleft()
             try:
-                await context.add_message({"role": "user", "content": content, "metadata": input_metadata(command)})
+                await context.add_message(message)
+                if command.attachments:
+                    await checkpoint_attachment(message, self.coordinator)
             except BaseException:
                 if command.target_generation_id is None:
                     await self.runtime.emit("input.unknown", input_id=command.id,
@@ -174,11 +196,26 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             if message.get("role") != "tool":
                 continue
             job = self.native_job(message.get("tool_call_id"))
-            if job and "result" in job and message.get("content") == job.get("receipt"):
-                message["content"] = job["result"]
-                changed = True
+            if job and "result" in job:
+                updated = apply_result(message, job)
+                row_changed = message != updated
+                changed |= row_changed
+                if (job.get("settled_result", {}).get("metadata") or {}).get("experimental.media.v1"):
+                    identity = (job.get("job_id", job["call_id"]), job["result_fingerprint"])
+                    if row_changed or identity not in self._job_media_checkpointed:
+                        # Arm before context publication: it may install the
+                        # refs and then lose acknowledgment or be cancelled.
+                        self._job_media_checkpoint_pending.add(identity)
+                message.update(updated)
         if changed:
             await context.set_messages(messages)
+        if self._job_media_checkpoint_pending:
+            from amplifier_module_loop_streaming.media import checkpoint_settled_results
+            await checkpoint_settled_results(self.coordinator, has_media=True)
+            # This is not a media commit report. The host's media owner must
+            # validate its exact canonical save acknowledgment before hydration.
+            self._job_media_checkpointed.update(self._job_media_checkpoint_pending)
+            self._job_media_checkpoint_pending.clear()
 
     async def start_native_job(self, call):
         await self._execute_tool_only(call, self.tools, self.hooks, None, self.coordinator)
@@ -193,17 +230,83 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
     async def execute(self, prompt, context, providers, tools, hooks, coordinator=None):
         self.host = (coordinator.get_capability("live.host") if coordinator else None) or HOST_ADAPTER.get() or HostAdapter()
         token = HOST_ADAPTER.set(self.host)
+        provider_token = _PROVIDER_VIEWS.set(None)
         try:
-            runtime, providers, finite_scope = await self.host.prepare_execution(self, coordinator, providers)
-            with self.approved_dispatch.run_scope(coordinator):
-                return await self._execute_live(prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope)
+            with ExitStack() as registration:
+                coordinator, hooks = registration.enter_context(
+                    self.host.execution_registration(coordinator, hooks))
+                runtime, providers, finite_scope = await self.host.prepare_execution(self, coordinator, providers)
+                with self.approved_dispatch.run_scope(coordinator):
+                    return await self._execute_live(prompt, context, providers, tools, hooks, coordinator,
+                                                    runtime, finite_scope, registration.close)
         finally:
+            _PROVIDER_VIEWS.reset(provider_token)
             HOST_ADAPTER.reset(token)
 
-    async def _execute_live(self, prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope):
+    async def _mount_live_tools(self, tools, coordinator):
+        from .jobs import AsyncTool, JobControl
+        eligible = set(self.config.get("background_tools", ["delegate"]))
+        adapter_mount = getattr(coordinator, "mount_adapter", None)
+        for name in eligible.intersection(tools):
+            if not isinstance(tools[name], AsyncTool):
+                wrapped = AsyncTool(tools[name])
+                # Preserve source provenance on a participating host's actual
+                # adapter edge. Ordinary Core hosts use their public mount.
+                if callable(adapter_mount):
+                    await adapter_mount("tools", wrapped, previous=tools[name], name=name)
+                else:
+                    await coordinator.mount("tools", wrapped, name=name)
+                # A host's public mount may install a guarded/decorated object.
+                # Never overwrite that canonical slot with our pre-mount input.
+                tools[name] = self._installed_tool(coordinator, name)
+        job_control = JobControl(self)
+        if "live_job" in tools and callable(adapter_mount):
+            await adapter_mount("tools", job_control, previous=tools["live_job"], name="live_job")
+        else:
+            await coordinator.mount("tools", job_control, name="live_job")
+        tools["live_job"] = self._installed_tool(coordinator, "live_job")
+
+    @staticmethod
+    def _installed_tool(coordinator, name):
+        installed = coordinator.get("tools")
+        if not isinstance(installed, dict) or name not in installed:
+            raise RuntimeError("Live tool mount was not acknowledged in the canonical inventory")
+        return installed[name]
+
+    async def _execute_live(self, prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope,
+                            registration_ready=None):
+        # A host may replace rather than mutate its providers. Prepare all
+        # aliases after native installation: later pins and utility selections
+        # must not bypass even the neutral/no-vision request adapter.
+        try:
+            prepared = {}
+            for name, provider in providers.items():
+                view = self.host.prepare_provider(provider, coordinator)
+                prepared[name] = provider if view is None else view
+            if self.root_provider is not None:
+                alias = next((name for name, provider in providers.items()
+                              if provider is self.root_provider), None)
+                if alias is not None:
+                    self.root_provider = prepared[alias]
+                else:
+                    view = self.host.prepare_provider(self.root_provider, coordinator)
+                    if view is not None:
+                        self.root_provider = view
+            # Nested model.complete/model.current obtain the coordinator's raw
+            # mounts. Bind the same prepared aliases in this execution context
+            # without mutating host mounts or leaking a child/parent cache.
+            _PROVIDER_VIEWS.set({id(provider): (provider, prepared[name])
+                                 for name, provider in providers.items()})
+            providers = prepared
+        except BaseException as exc:
+            self.host.finite_finished(finite_scope, coordinator,
+                                     "cancelled" if isinstance(exc, asyncio.CancelledError) else "error")
+            raise
         if runtime is None:
             # CLI's production spawner expects a finite result from workers.
             try:
+                if registration_ready:
+                    registration_ready()
                 result=await self._execute_guarded_goal(prompt, context, providers, tools, hooks, coordinator)
                 self.host.finite_finished(finite_scope, coordinator, "completed", result)
                 return result
@@ -220,12 +323,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             activation.reset(token)
         self.running, self.runtime = True, runtime
         self.context, self.tools, self.hooks, self.coordinator = context, tools, hooks, coordinator
-        from .jobs import AsyncTool, JobControl
-        eligible = set(self.config.get("background_tools", ["delegate"]))
-        for name in eligible.intersection(tools):
-            if not isinstance(tools[name], AsyncTool):
-                tools[name] = AsyncTool(tools[name])
-        tools["live_job"] = JobControl(self)
         coordinator.register_capability("context.active_operations", lambda: [
             {"job_id": identity, "call_id": job["call_id"], "status": job.get("status", "pending"),
              "tool": (job.get("tool_call") or {}).get("name")}
@@ -240,7 +337,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                                              "recovered": row["job_id"] in recovered}
         from .scope import LIVE_OWNER
         native = self._select_provider(providers)
-        self.host.prepare_provider(native, coordinator)
         native = native if getattr(native, "native_bundle_live", False) else None
         runtime.anchored_steering_mode = "unavailable" if native else "request_boundary"
         runtime.steering_wake = lambda: self.steer(_WAKE)
@@ -291,10 +387,25 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 if continuation:
                     turn_context = ContinuationContext(context)
                 else:
-                    await runtime.emit("input.delivered", input_id=command.id,
-                                       delivery="new_turn", source=command.source, call_id=command.call_id)
                     if command.attachments:
-                        turn_context = AttachmentContext(context, self._text(command), self.host.content(command, coordinator))
+                        try:
+                            encoded = await attachment_content(self.host, command, coordinator)
+                            if runtime.stop_requested:
+                                raise asyncio.CancelledError
+                            self._validate_input_activation(command)
+                        except BaseException:
+                            await self._hold_input(command, "attachment-preparation-not-admitted")
+                            raise
+                        async def attachment_disposition(disposition):
+                            await runtime.emit("input." + disposition, input_id=command.id,
+                                delivery="new_turn", source=command.source, call_id=command.call_id,
+                                **({"reason": "context-insertion-unconfirmed"}
+                                   if disposition == "unknown" else {}))
+                        turn_context = AttachmentContext(context, self._text(command), encoded, coordinator,
+                                                         on_disposition=attachment_disposition)
+                    else:
+                        await runtime.emit("input.delivered", input_id=command.id,
+                                           delivery="new_turn", source=command.source, call_id=command.call_id)
                     turn_context = InputContext(turn_context, self._text(command), command)
                 stage = "manager_turn"
                 result = await self._execute_guarded_goal(
@@ -316,6 +427,12 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 LIVE_OWNER.reset(owner_token)
 
         try:
+            # Establish the same terminal cleanup before the first host mount
+            # await. A lost mount acknowledgment is not rollback or permission
+            # to repeat execution, but must not leak this live owner.
+            await self._mount_live_tools(tools, coordinator)
+            if registration_ready:
+                registration_ready()
             await runtime.emit("session.ready", mode="configured_bundle", native=bool(native),
                 steering="native" if native else "request_boundary", async_tools="native" if native else "delegate_job_handles" if
                 self.config.get("background_delegate") else "none",
@@ -412,7 +529,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                             # Multimodal updates enter through the normal Amplifier
                             # message serializer at the next request boundary.
                             if (native and active is not None and not active.done()
-                                    and not value.attachments and not self.pending
+                                    and not value.attachments and value.job_result is None and not self.pending
                                     and not runtime.pending_steering and not self._boundary_pending):
                                 self._validate_input_activation(value)
                                 try:
@@ -569,9 +686,12 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         if existing:
             if existing.get("tool_call") != tool_call.model_dump():
                 raise RuntimeError("Tool call identity was reused with different content")
-            return tool_call.id, tool_call.name, existing.get("result", existing["receipt"])
+            if "settled_result" in existing:
+                return SettledToolResult.from_legacy(existing["settled_result"])
+            return SettledToolResult(tool_call.id, tool_call.name, existing.get("result", existing["receipt"]))
         if sum(not job["task"].done() for job in self.jobs.values()) >= self.config.get("max_background_jobs", 4):
-            return tool_call.id, tool_call.name, json.dumps({"success": False, "error": "Background job limit reached; wait for existing jobs before submitting more."})
+            return SettledToolResult(tool_call.id, tool_call.name, json.dumps({"success": False,
+                "error": "Background job limit reached; wait for existing jobs before submitting more."}), success=False)
         job_id = str(uuid.uuid4())
         runtime = self.runtime
         ledger = coordinator.get_capability("live.jobs") if coordinator else None
@@ -598,8 +718,15 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 job["started"] = True
                 if job.get("cancel_requested"):
                     raise asyncio.CancelledError
-                _, _, result = await executor._execute_tool_only(
+                result = await executor._execute_tool_only(
                     tool_call, tools, hooks, parallel_group_id, coordinator)
+                if isinstance(result, (tuple, list)):
+                    # Historical streaming executes text-only three-tuples.
+                    if tuple(result[:2]) != (tool_call.id, tool_call.name):
+                        raise ValueError("Settled tool result identity conflicts with job")
+                    result = result[2]
+                else:
+                    result = settled_record(result, call_id=tool_call.id, tool_name=tool_call.name)
                 outcome, injections = "returned", executor._pending_ephemeral_injections
             except asyncio.CancelledError:
                 result, outcome = None, "cancelled"
@@ -621,20 +748,32 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                              "tool_call": tool_call.model_dump(), "receipt": receipt, "status": "pending"}
         self._tool_calls_this_turn += 1
         await runtime.emit("job.queued", job_id=job_id, call_id=tool_call.id, tool=tool_call.name)
-        return tool_call.id, tool_call.name, self.jobs[job_id]["receipt"]
+        return SettledToolResult(tool_call.id, tool_call.name, self.jobs[job_id]["receipt"])
 
     async def _job_returned(self, job_id, result, outcome, injections=(), *, deliver):
         job = self.jobs[job_id]
+        fields = result_fields(result, outcome, call_id=job["call_id"],
+                               tool_name=job["tool_call"]["name"])
+        ledger = self.coordinator.get_capability("live.jobs")
+        if ledger is not None:
+            saved = ledger.rows[job["call_id"]]
+            if (saved["job_id"] != job_id or saved["status"] != outcome
+                    or any(saved.get(key) != value for key, value in fields.items())):
+                raise RuntimeError("Inbox job result conflicts with the saved ledger")
         job["status"] = outcome
-        job["result"] = serialize_result(result, outcome)
+        job.update(fields)
         await self.runtime.emit("job." + outcome, job_id=job_id, call_id=job["call_id"],
                                 outcome="tool_report" if outcome == "returned" else outcome,
                                 effects="not_rolled_back")
         if deliver:
             self._pending_ephemeral_injections.extend(injections)
             activation = self.coordinator.get_capability("live.activation")
+            record = job.get("settled_result")
             self.pending.append(Input("service", json.dumps({"job_id": job_id,
-                "call_id": job["call_id"], "status": outcome, "tool_report": result}), source="amplifier-delegate", call_id=job["call_id"],
+                "call_id": job["call_id"], "status": outcome, "tool_report": job["result"]}), source="amplifier-delegate", call_id=job["call_id"],
+                job_result={"version": 1, "job_id": job_id, "call_id": job["call_id"], "status": outcome,
+                            "metadata": copy.deepcopy(record["metadata"]) if record else {},
+                            "result_fingerprint": job.get("result_fingerprint")},
                 activation=activation.current() if activation else None))
             self.steer(_WAKE)
 
