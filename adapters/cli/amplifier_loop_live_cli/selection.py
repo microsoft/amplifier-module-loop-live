@@ -24,6 +24,18 @@ def optional_request_call(method, request, *, request_options=None, **kwargs):
     return method(request, **kwargs)
 
 
+def accepted_preparation(result, accept):
+    """Commit cleanup identity only after an actual preparation succeeds."""
+    if inspect.isawaitable(result):
+        async def wait():
+            value = await result
+            accept()
+            return value
+        return wait()
+    accept()
+    return result
+
+
 async def choices_for(providers, plan, *, discover=True):
     rows = []
     for spec in plan.get("providers", []):
@@ -95,18 +107,22 @@ class RootProvider:
         return view, kwargs
 
     def _request_budget(self, request, *, request_options=None, **kwargs):
-        request, options = self._prepare_request_view(request, request_options)
-        return optional_request_call(self.provider.request_budget, request, request_options=options, **kwargs)
+        view, options, accept = self._prepare_request_view(request, request_options)
+        return accepted_preparation(optional_request_call(
+            self.provider.request_budget, view, request_options=options, **kwargs), accept)
 
     def _refit_request(self, request, *, request_options=None, **kwargs):
-        request, options = self._prepare_request_view(request, request_options)
-        return optional_request_call(self.provider.refit_request, request, request_options=options, **kwargs)
+        view, options, accept = self._prepare_request_view(request, request_options)
+        return accepted_preparation(optional_request_call(
+            self.provider.refit_request, view, request_options=options, **kwargs), accept)
 
     def _prepare_request_view(self, request, request_options):
         caller_options = copy.deepcopy(request_options or {})
         view, options = self._request_view(request, caller_options)
-        self._media_release_candidate = (request, view, caller_options, copy.deepcopy(options))
-        return view, options
+        candidate = (request, view, caller_options, copy.deepcopy(options))
+        def accept():
+            self._media_release_candidate = candidate
+        return view, options, accept
 
     def _stream(self, request, **kwargs):
         request, kwargs = self._request_view(request, kwargs)
@@ -117,12 +133,12 @@ class RootProvider:
         return self.provider.compact_context(request, **kwargs)
 
     def _media_budget_witness(self, request, *, request_options=None):
-        request, options = self._prepare_request_view(request, request_options)
-        return self.provider.media_budget_witness(request, request_options=options)
+        view, options, accept = self._prepare_request_view(request, request_options)
+        return accepted_preparation(self.provider.media_budget_witness(view, request_options=options), accept)
 
     def _media_text_fallback_witness(self, request, *, request_options=None):
-        request, options = self._prepare_request_view(request, request_options)
-        return self.provider.media_text_fallback_witness(request, request_options=options)
+        view, options, accept = self._prepare_request_view(request, request_options)
+        return accepted_preparation(self.provider.media_text_fallback_witness(view, request_options=options), accept)
 
     def _release_media_request(self, request, *, request_options=None):
         candidate = self._media_release_candidate
@@ -130,7 +146,10 @@ class RootProvider:
             return False
         # Cleanup is an identity lookup, never a new selection/conversion. The
         # caller may have mutated its request or changed selection since count.
-        return self.provider.release_media_request(candidate[1], request_options=copy.deepcopy(candidate[3]))
+        result = self.provider.release_media_request(candidate[1], request_options=copy.deepcopy(candidate[3]))
+        if result is True:
+            self._media_release_candidate = None
+        return result
 
     def _get_stream_request_support(self, *, model, request_options=None):
         options = dict(request_options or {})

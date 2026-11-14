@@ -303,7 +303,7 @@ async def test_release_forwards_exact_cached_count_candidate_and_effective_optio
     options = {"temperature": 0.25, "extra": {"a": [1]}}
     await view.request_budget(request, request_options=options)
     assert view.release_media_request(request, request_options=copy.deepcopy(options)) is True
-    assert view.release_media_request(request, request_options=copy.deepcopy(options)) is True
+    assert view.release_media_request(request, request_options=copy.deepcopy(options)) is False
     assert all(record[1] is records[0][1] for record in records)
     assert all(record[2] == records[0][2] for record in records)
     assert records[0][1] is not request
@@ -311,6 +311,7 @@ async def test_release_forwards_exact_cached_count_candidate_and_effective_optio
     def fail(request, *, request_options=None):
         raise TypeError("release implementation error")
     driver.release_media_request = fail
+    await view.request_budget(request, request_options=options)
     with pytest.raises(TypeError, match="implementation error"):
         view.release_media_request(request, request_options=options)
 

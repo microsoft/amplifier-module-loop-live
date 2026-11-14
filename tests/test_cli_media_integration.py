@@ -195,15 +195,20 @@ async def test_actual_f1_text_fallback_uses_same_selected_view_as_dispatch(tmp_p
         await owner.cleanup()
 
 
-@pytest.mark.parametrize("wrapper", ["root", "worker-foreign-tools"])
-@pytest.mark.parametrize("mutation", ["canonical", "selection", "copy-then-valid", "stale-then-current"])
+@pytest.mark.parametrize("wrapper", ["root", "worker-foreign-tools", "worker-ordinary-tools"])
+@pytest.mark.parametrize("mutation", ["canonical", "selection", "copy-then-valid", "stale-then-current",
+                                    "rejected-witness", "busy-prepare"])
 async def test_actual_f1_release_preserves_preparation_time_selected_binding(tmp_path, wrapper, mutation):
     from amplifier_core.message_models import ToolSpec
     from amplifier_foundation.session.media_provider import MediaPreparedProvider
     if not hasattr(MediaPreparedProvider, "release_media_request"):
         pytest.skip("Requires the exact candidate-release Foundation API")
+    entered, release = asyncio.Event(), asyncio.Event()
     class Counted(Provider):
         async def request_budget(self, request, *, context_estimate=None, request_options=None):
+            if mutation == "busy-prepare":
+                entered.set()
+                await release.wait()
             return {"estimated_input_tokens": 10, "input_limit_tokens": 100,
                     "context_token_budget": 100, "measurement": {
                         "kind": "provider_count", "source": "offline synthetic owner", "input_tokens": 10}}
@@ -221,18 +226,35 @@ async def test_actual_f1_release_preserves_preparation_time_selected_binding(tmp
     view = CLIHostAdapter().prepare_provider(raw, owner)
     prepared = host.wrappers[id(driver)][1]
     def request():
+        tool = ToolSpec(name="computer", parameters={}, description="fixture")
+        if wrapper != "worker-ordinary-tools":
+            tool = tool.model_copy(update={"type": "computer"})
         return ChatRequest(messages=[Message(role="user", content=[{
             "type": "image", "source": {"type": "base64", "media_type": "image/png",
                                       "data": base64.b64encode(pixels()).decode()}}])],
-            tools=[ToolSpec(name="computer", parameters={}, description="fixture").model_copy(update={"type": "computer"})])
+            tools=[tool])
     canonical, options = request(), {"temperature": 0.3}
     try:
-        await view.request_budget(canonical, request_options=options)
+        if mutation == "busy-prepare":
+            counting = asyncio.create_task(view.request_budget(canonical, request_options=options))
+            await asyncio.wait_for(entered.wait(), 2)
+            with pytest.raises(ValueError, match="active operation"):
+                await view.request_budget(canonical.model_copy(deep=True), request_options=options)
+            release.set()
+            await counting
+        else:
+            await view.request_budget(canonical, request_options=options)
         candidate = prepared._candidate
         if mutation == "canonical":
             canonical.messages[0].content = "mutated after preparation"
         elif mutation == "selection" and wrapper == "root":
             view.selection = {**view.selection, "model": "later-model", "effort": "low"}
+        elif mutation == "rejected-witness":
+            with pytest.raises(ValueError, match="No measured media budget"):
+                view.media_budget_witness(canonical.model_copy(deep=True), request_options=options)
+            assert prepared._candidate is candidate
+        elif mutation == "busy-prepare":
+            pass
         elif mutation in {"copy-then-valid", "selection"}:
             assert view.release_media_request(canonical.model_copy(deep=True), request_options=options) is False
             assert prepared._candidate is candidate
