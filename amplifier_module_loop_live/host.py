@@ -46,7 +46,8 @@ class HostAdapter:
         pass
 
     def prepare_provider(self, provider, coordinator):
-        pass
+        """Return the selected view; legacy mutation-only hosts may return None."""
+        return provider
 
     def content(self, command, coordinator):
         encode = coordinator.get_capability("live.attachments.encode") if coordinator else None

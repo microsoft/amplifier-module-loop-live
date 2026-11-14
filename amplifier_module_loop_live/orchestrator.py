@@ -27,6 +27,7 @@ from .dispatch import ApprovedDispatch
 
 _WAKE = "[loop-live inbox wake]"
 _GOAL_SCOPE = ContextVar("live_goal_scope", default=None)
+_PROVIDER_VIEWS = ContextVar("live_provider_views", default=None)
 
 
 class BundleLiveOrchestrator(StreamingOrchestrator):
@@ -76,6 +77,11 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         return result
 
     def _select_provider(self, providers):
+        views = _PROVIDER_VIEWS.get()
+        if views:
+            providers = {name: views[id(provider)][1]
+                         if id(provider) in views and views[id(provider)][0] is provider else provider
+                         for name, provider in providers.items()}
         return self.root_provider or super()._select_provider(providers)
 
     async def _hold_anchored(self, reason):
@@ -173,14 +179,43 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
     async def execute(self, prompt, context, providers, tools, hooks, coordinator=None):
         self.host = (coordinator.get_capability("live.host") if coordinator else None) or HOST_ADAPTER.get() or HostAdapter()
         token = HOST_ADAPTER.set(self.host)
+        provider_token = _PROVIDER_VIEWS.set(None)
         try:
             runtime, providers, finite_scope = await self.host.prepare_execution(self, coordinator, providers)
             with self.approved_dispatch.run_scope(coordinator):
                 return await self._execute_live(prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope)
         finally:
+            _PROVIDER_VIEWS.reset(provider_token)
             HOST_ADAPTER.reset(token)
 
     async def _execute_live(self, prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope):
+        # A host may replace rather than mutate its providers. Prepare all
+        # aliases after native installation: later pins and utility selections
+        # must not bypass even the neutral/no-vision request adapter.
+        try:
+            prepared = {}
+            for name, provider in providers.items():
+                view = self.host.prepare_provider(provider, coordinator)
+                prepared[name] = provider if view is None else view
+            if self.root_provider is not None:
+                alias = next((name for name, provider in providers.items()
+                              if provider is self.root_provider), None)
+                if alias is not None:
+                    self.root_provider = prepared[alias]
+                else:
+                    view = self.host.prepare_provider(self.root_provider, coordinator)
+                    if view is not None:
+                        self.root_provider = view
+            # Nested model.complete/model.current obtain the coordinator's raw
+            # mounts. Bind the same prepared aliases in this execution context
+            # without mutating host mounts or leaking a child/parent cache.
+            _PROVIDER_VIEWS.set({id(provider): (provider, prepared[name])
+                                 for name, provider in providers.items()})
+            providers = prepared
+        except BaseException as exc:
+            self.host.finite_finished(finite_scope, coordinator,
+                                     "cancelled" if isinstance(exc, asyncio.CancelledError) else "error")
+            raise
         if runtime is None:
             # CLI's production spawner expects a finite result from workers.
             try:
@@ -214,7 +249,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                                              "recovered": row["job_id"] in recovered}
         from .scope import LIVE_OWNER
         native = self._select_provider(providers)
-        self.host.prepare_provider(native, coordinator)
         native = native if getattr(native, "native_bundle_live", False) else None
         runtime.anchored_steering_mode = "unavailable" if native else "request_boundary"
         runtime.steering_wake = lambda: self.steer(_WAKE)

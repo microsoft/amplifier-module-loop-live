@@ -110,17 +110,15 @@ async def test_real_streaming_posthook_carrier_survives_live_ledger_and_paging(e
         page = await JobControl(loop).execute({"action": "read", "job_id": job_id, "offset": 3, "limit": 5})
         assert page.output["result_metadata"] == record["metadata"]
         assert loop.pending[0].job_result["metadata"] == record["metadata"]
-        if mode == "keep":
-            assert record["metadata"][MEDIA]["refs"]
-            assert record["result"]["output"][MEDIA] == record["metadata"][MEDIA]
-            restored, _ = store.recover([])
-            assert next(m for m in restored if m["role"] == "tool")["metadata"] == record["metadata"]
-            again = await loop._execute_tool_only(call, {}, coordinator.hooks, None, coordinator)
-            assert isinstance(again, SettledToolResult) and again.model_dump() == record
-        else:
-            assert MEDIA not in record["metadata"]
-        if mode == "absent":
+        # Core's summarized hook result cannot attest the complete chain.
+        # Without the qualified host bridge even "keep" must stay unavailable.
+        assert MEDIA not in record["metadata"]
+        if mode in {"absent", "keep"}:
             assert UNAVAILABLE in record["content"]
+        restored, _ = store.recover([])
+        assert next(m for m in restored if m["role"] == "tool").get("metadata", {}) == record["metadata"]
+        again = await loop._execute_tool_only(call, {}, coordinator.hooks, None, coordinator)
+        assert isinstance(again, SettledToolResult) and again.model_dump() == record
         persisted = json.dumps({"row": store.rows["call"], "job": {k: v for k, v in job.items() if k != "task"},
                                 "pending": [input_metadata(c) for c in loop.pending],
                                 "events": loop.runtime.events, "page": page.output})
