@@ -421,3 +421,74 @@ async def test_cancel_during_attachment_checkpoint_preserves_append_and_unknown_
     assert loop._boundary_pending  # No request may dispatch from this failed drain.
     await loop._drain_steering(context, SimpleNamespace(emit=AsyncMock()), 2)
     assert len(context.messages) == 1
+
+
+@pytest.mark.parametrize("checkpoint_outcome", ["cancel", "lost-ack", "ack"])
+async def test_initial_attachment_delivery_requires_append_checkpoint_ack(checkpoint_outcome):
+    """Actual engine new-turn append; a native provider is not needed for this race."""
+    from amplifier_core import AmplifierSession
+    from test_loop import Provider
+    runtime, provider = Runtime(), Provider()
+    entered, release = asyncio.Event(), asyncio.Event()
+    session = AmplifierSession({"session": {
+        "orchestrator": {"module": "loop-live", "config": {"min_delay_between_calls_ms": 0}},
+        "context": {"module": "context-simple"}}, "providers": []})
+    await session.initialize()
+    owner, checkpoints = session.coordinator, []
+    context = owner.get("context")
+    encoded = {"content": "initial canonical attachment",
+               "metadata": {MEDIA: carrier()["metadata"][MEDIA]}}
+    async def encode(*args):
+        return copy.deepcopy(encoded)
+    async def checkpoint():
+        rows = await context.get_messages()
+        checkpoints.append(copy.deepcopy(rows))
+        if len(checkpoints) == 1:
+            entered.set()
+            await release.wait()
+            if checkpoint_outcome == "lost-ack":
+                raise OSError("fixture lost durable acknowledgment")
+        return {"saved": True}
+    owner.register_capability("live.runtime", runtime)
+    owner.register_capability("live.attachments.encode", encode)
+    owner.register_capability("session.durable_checkpoint", checkpoint)
+    await owner.mount("providers", provider, name="fixture")
+    command = Input("user", "initial prompt", id="initial-checkpoint", attachments=("upload",))
+    task = asyncio.create_task(session.execute(""))
+    try:
+        await runtime.wait_for(lambda e: e["type"] == "session.ready", 2)
+        await runtime.submit(command)
+        await asyncio.wait_for(entered.wait(), 2)
+        assert provider.requests.empty()
+        assert not any(e["type"] == "input.delivered" and e.get("input_id") == command.id
+                       for e in runtime.events)
+        if checkpoint_outcome == "cancel":
+            await runtime.submit(Input("stop"))
+            await asyncio.wait_for(task, 2)
+        else:
+            release.set()
+            if checkpoint_outcome == "lost-ack":
+                # The actual Rust session wraps the engine failure, preserving
+                # no-replay status rather than the inner checkpoint exception.
+                with pytest.raises(RuntimeError, match="not automatically replayed"):
+                    await asyncio.wait_for(task, 2)
+            else:
+                await provider.request()
+                await provider.reply("done")
+                await runtime.wait_for(lambda e: e["type"] == "generation.finished", 2)
+        rows = await context.get_messages()
+        matching = [m for m in rows if (m.get("metadata") or {}).get("amplifier_input", {}).get("id") == command.id]
+        assert len(matching) == 1 and matching[0]["metadata"][MEDIA] == encoded["metadata"][MEDIA]
+        dispositions = [e["type"] for e in runtime.events if e.get("input_id") == command.id
+                        and e["type"] in {"input.delivered", "input.unknown", "input.held"}]
+        assert dispositions == ["input.delivered" if checkpoint_outcome == "ack" else "input.unknown"]
+        if checkpoint_outcome != "ack":
+            assert provider.requests.empty()
+            terminal = next(e for e in runtime.events if e["type"] in {"generation.failed", "generation.detached"})
+            assert command.id not in terminal["input_ids"]
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await session.cleanup()

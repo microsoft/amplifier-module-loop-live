@@ -364,9 +364,16 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                         except BaseException:
                             await self._hold_input(command, "attachment-preparation-not-admitted")
                             raise
-                        turn_context = AttachmentContext(context, self._text(command), encoded, coordinator)
-                    await runtime.emit("input.delivered", input_id=command.id,
-                                       delivery="new_turn", source=command.source, call_id=command.call_id)
+                        async def attachment_disposition(disposition):
+                            await runtime.emit("input." + disposition, input_id=command.id,
+                                delivery="new_turn", source=command.source, call_id=command.call_id,
+                                **({"reason": "context-insertion-unconfirmed"}
+                                   if disposition == "unknown" else {}))
+                        turn_context = AttachmentContext(context, self._text(command), encoded, coordinator,
+                                                         on_disposition=attachment_disposition)
+                    else:
+                        await runtime.emit("input.delivered", input_id=command.id,
+                                           delivery="new_turn", source=command.source, call_id=command.call_id)
                     turn_context = InputContext(turn_context, self._text(command), command)
                 stage = "manager_turn"
                 result = await self._execute_guarded_goal(

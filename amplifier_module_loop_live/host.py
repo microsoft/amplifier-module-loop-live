@@ -59,9 +59,10 @@ class HostAdapter:
 class AttachmentContext:
     """Preserve prompt hooks while replacing the corresponding user message."""
 
-    def __init__(self, context, prompt, content, coordinator=None):
+    def __init__(self, context, prompt, content, coordinator=None, *, on_disposition=None):
         self.context, self.prompt, self.content = context, prompt, content
         self.coordinator = coordinator
+        self.on_disposition = on_disposition
         self.pending = True
 
     def __getattr__(self, name):
@@ -71,7 +72,16 @@ class AttachmentContext:
         if self.pending and message.get("role") == "user" and message.get("content") == self.prompt:
             message = attachment_message(message, self.content)
             self.pending = False
-            result = await self.context.add_message(message)
-            await checkpoint_attachment(message, self.coordinator)
+            try:
+                result = await self.context.add_message(message)
+                await checkpoint_attachment(message, self.coordinator)
+            except BaseException:
+                # An attempted append or its checkpoint may have taken effect.
+                # Never report an untouched input or make it replayable here.
+                if self.on_disposition:
+                    await self.on_disposition("unknown")
+                raise
+            if self.on_disposition:
+                await self.on_disposition("delivered")
             return result
         return await self.context.add_message(message)
