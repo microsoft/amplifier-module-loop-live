@@ -13,8 +13,9 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "adapters/cli"))
-from amplifier_loop_live_cli.selection import select_root
+from amplifier_loop_live_cli.selection import select_root, RootProvider
 from amplifier_module_loop_live.scope import NATIVE_REQUEST
+from amplifier_core.message_models import ChatRequest
 
 
 @pytest.fixture
@@ -102,3 +103,21 @@ async def test_ordinary_complete_clears_and_restores_nested_native_attribution(
         assert NATIVE_REQUEST.get() is previous
     finally:
         NATIVE_REQUEST.reset(token)
+
+
+@pytest.mark.parametrize("method", ["stream", "refit_request", "compact_context", "request_budget"])
+@pytest.mark.parametrize("support", ["absent", "none", "callable"])
+def test_optional_provider_methods_are_only_callable_when_original_supports_them(
+    ordinary_adapter, method, support
+):
+    adapter, provider_class = ordinary_adapter
+    original = provider_class()
+    if support != "absent":
+        setattr(original, method, None if support == "none" else lambda *a, **kw: "original")
+    provider = adapter.BundleAstraProvider.wrap(original)
+    root = RootProvider(provider, {"model": "gpt-6-astra", "effort": "low"}, "openai")
+    exposed = getattr(root, method, None)
+    assert callable(exposed) is (support == "callable")
+    if callable(exposed):
+        # Optional request consumers now apply selection before projection.
+        assert exposed(ChatRequest(messages=[])) == "original"
