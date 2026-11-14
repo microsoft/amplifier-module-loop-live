@@ -493,3 +493,60 @@ async def test_initial_attachment_delivery_requires_append_checkpoint_ack(checkp
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await session.cleanup()
+
+
+@pytest.mark.parametrize("mount_name", ["delegate", "live_job"])
+@pytest.mark.parametrize("failure", ["cancel", "lost-ack"])
+async def test_live_mount_interruption_closes_owner_without_rolling_back_effect(mount_name, failure):
+    from amplifier_core import AmplifierSession
+    from amplifier_module_loop_live.jobs import AsyncTool, JobControl
+    from test_loop import NativeProvider, Delegate
+    runtime = Runtime()
+    session = AmplifierSession({"session": {"orchestrator": {"module": "loop-live"},
+                                           "context": {"module": "context-simple"}}, "providers": []})
+    await session.initialize()
+    owner = session.coordinator
+    driver = NativeProvider(runtime)
+    driver.close_live = AsyncMock()
+    await owner.mount("providers", driver, name="fixture")
+    await owner.mount("tools", Delegate(), name="delegate")
+    owner.register_capability("live.runtime", runtime)
+    entered = asyncio.Event()
+    attempted = []
+    class MountView:
+        def __getattr__(self, name):
+            return getattr(owner, name)
+        async def mount(self, kind, module, *, name):
+            await owner.mount(kind, module, name=name)
+            attempted.append(name)
+            if name == mount_name:
+                entered.set()
+                if failure == "lost-ack":
+                    raise RuntimeError("mount acknowledgment lost")
+                await asyncio.Event().wait()
+    view = MountView()
+    loop = owner.get("orchestrator")
+    task = asyncio.create_task(loop.execute("", owner.get("context"), owner.get("providers"),
+                                           owner.get("tools"), owner.hooks, view))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if failure == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(RuntimeError, match="mount acknowledgment lost"):
+                await task
+        assert not loop.running and loop.runtime is None and runtime.closed
+        assert runtime.steering_wake is None and runtime.anchored_steering_mode is None
+        driver.close_live.assert_awaited_once()
+        assert isinstance(owner.get("tools", mount_name), AsyncTool if mount_name == "delegate" else JobControl)
+        assert attempted == (["delegate"] if mount_name == "delegate" else ["delegate", "live_job"])
+        assert not driver.requests.qsize()
+        assert not any(event["type"] == "session.ready" for event in runtime.events)
+        assert len([event for event in runtime.events if event["type"] == "session.closed"]) == 1
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await session.cleanup()

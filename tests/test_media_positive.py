@@ -8,11 +8,12 @@ import base64
 import copy
 import hashlib
 import inspect
+from importlib.machinery import ModuleSpec
 import io
 import json
 import os
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -218,26 +219,26 @@ async def test_public_positive_background_result_checkpoint_and_private_send(tmp
 
 @pytest.mark.parametrize("format", ["PNG", "JPEG"])
 @pytest.mark.parametrize("scope", ["root", "child"])
-async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_path, format, scope):
+async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_path, monkeypatch, format, scope):
     """Actual live engine path, with explicitly owned late execution callbacks."""
     from amplifier_core.message_models import ChatResponse, TextBlock
     from amplifier_module_loop_live.runtime import Input
     config = {"session": {"orchestrator": {"module": "loop-live", "config": {
         "background_delegate": True, "min_delay_between_calls_ms": 0}},
-        "context": {"module": "context-simple"}}, "providers": [], "session_media": POLICY}
+        "context": {"module": "context-simple"}}, "providers": [],
+        "tools": [{"module": "tool-offline-live-positive"}], "session_media": POLICY}
     parent_id = "offline-parent" if scope == "child" else None
     session = AmplifierSession(config, parent_id=parent_id)
     owner = session.coordinator
     bridge = bridge_module.install_media_hook_bridge(owner)
     graph = bridge.begin_participating_graph(session, owner="offline.live.manager.cli-components",
-        participants=("loop-live", "context-simple", "host.media", "host.execution"))
+        participants=("loop-live", "context-simple", "tool-offline-live-positive",
+                      "host.media", "host.execution"))
     view = graph.participant("host.execution")
     native = SessionStore(tmp_path / "sessions")
     host = install_session_media(SimpleNamespace(session_id=session.session_id, config=session.config,
                                                 coordinator=graph.participant("host.media")), native)
     install_session_checkpoint(session, native, session_id=session.session_id)
-    await session.initialize()
-    loop, context = owner.get("orchestrator"), owner.get("context")
     ledger = JobStore(tmp_path / "jobs")
     pixels = image_bytes(format)
     encoded = base64.b64encode(pixels).decode()
@@ -274,6 +275,17 @@ async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_pa
             counts["tool"] += 1
             return ToolResult(success=True, output="caption", content=[{"type": "image", "source": {
                 "type": "base64", "media_type": "image/" + format.lower(), "data": encoded}}])
+    # Normal Core filesystem-import discovery, not a replacement loader. The
+    # actual source-bound mount is needed to qualify the AsyncTool adapter edge.
+    module_name = "amplifier_module_tool_offline_live_positive"
+    module = ModuleType(module_name)
+    module.__file__, module.__spec__ = __file__, ModuleSpec(module_name, loader=None, origin=__file__)
+    async def mount_tool(current, config=None):
+        await current.mount("tools", Tool(), name="delegate")
+    module.mount = mount_tool
+    monkeypatch.setitem(sys.modules, module_name, module)
+    await session.initialize()
+    loop, context = owner.get("orchestrator"), owner.get("context")
     def status(event):
         if event["type"] == "session.ready":
             # The late CLI diagnostics and actual live-manager observers have
@@ -284,7 +296,6 @@ async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_pa
     owner.register_capability("live.host", CLIHostAdapter())
     owner.register_capability("live.jobs", ledger)
     await view.mount("providers", Selected(), name="account")
-    await view.mount("tools", Tool(), name="delegate")
     task = asyncio.create_task(loop.execute("", context, owner.get("providers"), owner.get("tools"),
                                            view.hooks, view))
     try:
@@ -345,7 +356,6 @@ async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_pa
         owner.register_capability("live.host", CLIHostAdapter())
         owner.register_capability("live.jobs", ledger)
         await view.mount("providers", Selected(), name="account")
-        await view.mount("tools", Tool(), name="delegate")
         image_sent.clear()
         task = asyncio.create_task(loop.execute("", context, owner.get("providers"), owner.get("tools"),
                                                view.hooks, view))

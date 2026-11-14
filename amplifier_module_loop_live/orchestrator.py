@@ -238,6 +238,27 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             _PROVIDER_VIEWS.reset(provider_token)
             HOST_ADAPTER.reset(token)
 
+    async def _mount_live_tools(self, tools, coordinator):
+        from .jobs import AsyncTool, JobControl
+        eligible = set(self.config.get("background_tools", ["delegate"]))
+        adapter_mount = getattr(coordinator, "mount_adapter", None)
+        for name in eligible.intersection(tools):
+            if not isinstance(tools[name], AsyncTool):
+                wrapped = AsyncTool(tools[name])
+                # Preserve source provenance on a participating host's actual
+                # adapter edge. Ordinary Core hosts use their public mount.
+                if callable(adapter_mount):
+                    await adapter_mount("tools", wrapped, previous=tools[name], name=name)
+                else:
+                    await coordinator.mount("tools", wrapped, name=name)
+                tools[name] = wrapped
+        job_control = JobControl(self)
+        if "live_job" in tools and callable(adapter_mount):
+            await adapter_mount("tools", job_control, previous=tools["live_job"], name="live_job")
+        else:
+            await coordinator.mount("tools", job_control, name="live_job")
+        tools["live_job"] = job_control
+
     async def _execute_live(self, prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope):
         # A host may replace rather than mutate its providers. Prepare all
         # aliases after native installation: later pins and utility selections
@@ -285,19 +306,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             activation.reset(token)
         self.running, self.runtime = True, runtime
         self.context, self.tools, self.hooks, self.coordinator = context, tools, hooks, coordinator
-        from .jobs import AsyncTool, JobControl
-        eligible = set(self.config.get("background_tools", ["delegate"]))
-        for name in eligible.intersection(tools):
-            if not isinstance(tools[name], AsyncTool):
-                wrapped = AsyncTool(tools[name])
-                # The coordinator owns the actual mount inventory. Use its
-                # public boundary so a host construction can attribute these
-                # execution-time replacements before admitting tool work.
-                await coordinator.mount("tools", wrapped, name=name)
-                tools[name] = wrapped
-        job_control = JobControl(self)
-        await coordinator.mount("tools", job_control, name="live_job")
-        tools["live_job"] = job_control
         coordinator.register_capability("context.active_operations", lambda: [
             {"job_id": identity, "call_id": job["call_id"], "status": job.get("status", "pending"),
              "tool": (job.get("tool_call") or {}).get("name")}
@@ -402,6 +410,10 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 LIVE_OWNER.reset(owner_token)
 
         try:
+            # Establish the same terminal cleanup before the first host mount
+            # await. A lost mount acknowledgment is not rollback or permission
+            # to repeat execution, but must not leak this live owner.
+            await self._mount_live_tools(tools, coordinator)
             await runtime.emit("session.ready", mode="configured_bundle", native=bool(native),
                 steering="native" if native else "request_boundary", async_tools="native" if native else "delegate_job_handles" if
                 self.config.get("background_delegate") else "none",
