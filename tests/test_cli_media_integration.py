@@ -50,7 +50,8 @@ async def test_actual_engine_counts_and_dispatches_through_cli_neutral_factory(t
     from amplifier_core.message_models import ChatResponse, TextBlock
     session = AmplifierSession({"session": {"orchestrator": {"module": "loop-live",
                                 "config": {"min_delay_between_calls_ms": 0}},
-                                "context": {"module": "context-simple"}}, "providers": []})
+                                "context": {"module": "context-simple"}}, "providers": [],
+                                "session_media": {"enabled": False}})
     native = SessionStore(tmp_path / "sessions")
     host = install_session_media(session, native)
     await session.initialize()
@@ -286,6 +287,8 @@ async def test_actual_cli_late_factory_uses_f1_private_projection_and_checkpoint
     config = {"session": {"orchestrator": "loop-live"}}
     if enabled:
         config["session_media"] = POLICY
+    else:
+        config["session_media"] = {"enabled": False}
     session = SimpleNamespace(session_id="root", coordinator=owner, config=config)
     native = SessionStore(tmp_path / "sessions")
     install_session_checkpoint(session, native, session_id="root")
