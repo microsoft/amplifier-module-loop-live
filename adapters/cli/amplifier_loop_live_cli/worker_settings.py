@@ -90,15 +90,52 @@ def effective_selection(provider, providers, request=None, kwargs=None):
 class ObservedWorkerProvider:
     def __init__(self, original, providers, registry, identity):
         self.original, self.providers, self.registry, self.identity = original, providers, registry, identity
+        self.alias = None
+        self._request_candidate = None
+        for name in ("request_budget", "refit_request", "stream", "compact_context", "media_budget_witness"):
+            if callable(getattr(original, name, None)):
+                setattr(self, name, getattr(self, "_" + name))
 
     def __getattr__(self, name):
         return getattr(self.original, name)
 
-    async def complete(self, request, **kwargs):
+    def _selection(self, request, kwargs):
         selected = effective_selection(self.original, self.providers, request, kwargs)
-        self.registry.configuration(self.identity, selected)
-        if request.tools and selected["provider"] not in {"openai","provider-openai"}:
-            from amplifier_core.message_models import ToolSpec
-            request=request.model_copy(update={"tools":[ToolSpec(name=t.name,parameters=t.parameters,description=t.description)
-                if getattr(t,"type","function")!="function" else t for t in request.tools]})
-        return await self.original.complete(request, **kwargs)
+        if self.alias is not None:
+            selected["instance"] = self.alias
+        return selected
+
+    def _request_view(self, request):
+        if not request.tools or self.original.get_info().id in {"openai", "provider-openai"}:
+            return request
+        if not any(getattr(tool, "type", "function") != "function" for tool in request.tools):
+            return request
+        cached, snapshot = self._request_candidate, request.model_dump()
+        if cached is not None and cached[0] is request and cached[1] == snapshot:
+            return cached[2]
+        from amplifier_core.message_models import ToolSpec
+        tools = [ToolSpec(name=t.name, parameters=t.parameters, description=t.description)
+                 if getattr(t, "type", "function") != "function" else t for t in request.tools]
+        view = request.model_copy(deep=True, update={"tools": tools})
+        self._request_candidate = (request, copy.deepcopy(snapshot), view)
+        return view
+
+    def _request_budget(self, request, **kwargs):
+        return self.original.request_budget(self._request_view(request), **kwargs)
+
+    def _refit_request(self, request, **kwargs):
+        return self.original.refit_request(self._request_view(request), **kwargs)
+
+    def _compact_context(self, request, **kwargs):
+        return self.original.compact_context(self._request_view(request), **kwargs)
+
+    def _media_budget_witness(self, request, **kwargs):
+        return self.original.media_budget_witness(self._request_view(request), **kwargs)
+
+    def _stream(self, request, **kwargs):
+        self.registry.configuration(self.identity, self._selection(request, kwargs))
+        return self.original.stream(self._request_view(request), **kwargs)
+
+    async def complete(self, request, **kwargs):
+        self.registry.configuration(self.identity, self._selection(request, kwargs))
+        return await self.original.complete(self._request_view(request), **kwargs)

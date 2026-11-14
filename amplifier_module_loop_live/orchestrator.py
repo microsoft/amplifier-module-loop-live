@@ -181,6 +181,28 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             HOST_ADAPTER.reset(token)
 
     async def _execute_live(self, prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope):
+        # A host may replace rather than mutate its providers. Prepare all
+        # aliases after native installation: later pins and utility selections
+        # must not bypass even the neutral/no-vision request adapter.
+        try:
+            prepared = {}
+            for name, provider in providers.items():
+                view = self.host.prepare_provider(provider, coordinator)
+                prepared[name] = provider if view is None else view
+            if self.root_provider is not None:
+                alias = next((name for name, provider in providers.items()
+                              if provider is self.root_provider), None)
+                if alias is not None:
+                    self.root_provider = prepared[alias]
+                else:
+                    view = self.host.prepare_provider(self.root_provider, coordinator)
+                    if view is not None:
+                        self.root_provider = view
+            providers = prepared
+        except BaseException as exc:
+            self.host.finite_finished(finite_scope, coordinator,
+                                     "cancelled" if isinstance(exc, asyncio.CancelledError) else "error")
+            raise
         if runtime is None:
             # CLI's production spawner expects a finite result from workers.
             try:
@@ -214,7 +236,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                                              "recovered": row["job_id"] in recovered}
         from .scope import LIVE_OWNER
         native = self._select_provider(providers)
-        self.host.prepare_provider(native, coordinator)
         native = native if getattr(native, "native_bundle_live", False) else None
         runtime.anchored_steering_mode = "unavailable" if native else "request_boundary"
         runtime.steering_wake = lambda: self.steer(_WAKE)

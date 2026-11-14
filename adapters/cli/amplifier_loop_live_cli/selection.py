@@ -1,5 +1,6 @@
 """Explicit root selection; mounted providers and worker routing stay intact."""
 import asyncio
+import copy
 from amplifier_loop_live_cli.catalog import MODELS, copilot_models, select_model, validate_controls, SelectionError
 
 FAMILIES = {"provider-openai": "openai", "provider-anthropic": "anthropic",
@@ -36,23 +37,18 @@ class RootProvider:
         self.runtime = runtime
         self.native_bundle_live = bool(getattr(provider, "native_bundle_live", False) and
                                        selection["model"] == "gpt-6-astra")
+        self._request_candidate = None
+        self._install_request_methods()
 
-    def __getattr__(self, name):
-        return getattr(self.provider, name)
+    def _install_request_methods(self):
+        # Optional methods must remain genuinely optional, and must apply the
+        # same selected model/options before private projection as complete().
+        for name in ("request_budget", "refit_request", "stream", "compact_context", "media_budget_witness"):
+            if callable(getattr(self.provider, name, None)):
+                setattr(self, name, getattr(self, "_" + name))
 
-    def get_info(self):
-        info = self.provider.get_info()
-        return info.model_copy(update={"defaults": {**info.defaults, "model": self.selection["model"]}})
-
-    async def complete(self, request, **kwargs):
-        from amplifier_loop_live_cli.diagnostics import trace
-        trace("provider.request", {"selection":self.selection,"request":request})
-        if self.runtime:
-            await self.runtime.emit("provider.request", **self.selection)
+    def _request_view(self, request, kwargs):
         updates = {"model": self.selection["model"], "reasoning_effort": self.selection["effort"]}
-        # A bundle may have mounted an OpenAI-native computer definition while
-        # another root provider is now selected. Keep its real tool/schema, but
-        # use a portable function instead of forwarding a foreign wire type.
         if request.tools and self.family != "openai":
             from amplifier_core.message_models import ToolSpec
             updates["tools"] = [ToolSpec(name=tool.name, parameters=tool.parameters, description=tool.description)
@@ -67,8 +63,54 @@ class RootProvider:
             kwargs.update(extended_thinking=budget > 0, thinking_budget_tokens=budget)
         if self.family in {"openai", "chatgpt"} and updates["reasoning_effort"] == "none":
             kwargs["reasoning"] = {"effort": "none"}
+        snapshot = request.model_dump()
+        cached = self._request_candidate
+        if cached is not None and cached[0] is request and cached[1] == snapshot and cached[2] == updates:
+            return cached[3], kwargs
+        view = request.model_copy(deep=True, update=updates)
+        # Only canonical refs live here. Keep the same canonical selected view
+        # across count and send so the provider can bind its private projection.
+        self._request_candidate = (request, copy.deepcopy(snapshot), copy.deepcopy(updates), view)
+        return view, kwargs
+
+    def _request_budget(self, request, **kwargs):
+        request, kwargs = self._request_view(request, kwargs)
+        return self.provider.request_budget(request, **kwargs)
+
+    def _refit_request(self, request, **kwargs):
+        request, kwargs = self._request_view(request, kwargs)
+        return self.provider.refit_request(request, **kwargs)
+
+    def _stream(self, request, **kwargs):
+        request, kwargs = self._request_view(request, kwargs)
+        return self.provider.stream(request, **kwargs)
+
+    def _compact_context(self, request, **kwargs):
+        request, kwargs = self._request_view(request, kwargs)
+        return self.provider.compact_context(request, **kwargs)
+
+    def _media_budget_witness(self, request, *, request_options=None):
+        request, options = self._request_view(request, request_options or {})
+        return self.provider.media_budget_witness(request, request_options=options)
+
+    def __getattr__(self, name):
+        return getattr(self.provider, name)
+
+    def get_info(self):
+        info = self.provider.get_info()
+        return info.model_copy(update={"defaults": {**info.defaults, "model": self.selection["model"]}})
+
+    async def complete(self, request, **kwargs):
+        from amplifier_loop_live_cli.diagnostics import trace
+        trace("provider.request", {"selection":self.selection,"request":request})
+        if self.runtime:
+            await self.runtime.emit("provider.request", **self.selection)
+        # A bundle may have mounted an OpenAI-native computer definition while
+        # another root provider is now selected. Keep its real tool/schema, but
+        # use a portable function instead of forwarding a foreign wire type.
+        request, kwargs = self._request_view(request, kwargs)
         try:
-            response = await self.provider.complete(request.model_copy(update=updates), **kwargs)
+            response = await self.provider.complete(request, **kwargs)
             trace("provider.response", {"selection":self.selection,"response":response})
             return response
         except Exception as exc:

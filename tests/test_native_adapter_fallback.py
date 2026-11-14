@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "adapters/cli"))
 from amplifier_loop_live_cli.selection import select_root, RootProvider
 from amplifier_module_loop_live.scope import NATIVE_REQUEST
+from amplifier_core.message_models import ChatRequest
 
 
 @pytest.fixture
@@ -118,4 +119,5 @@ def test_optional_provider_methods_are_only_callable_when_original_supports_them
     exposed = getattr(root, method, None)
     assert callable(exposed) is (support == "callable")
     if callable(exposed):
-        assert exposed() == "original"
+        # Optional request consumers now apply selection before projection.
+        assert exposed(ChatRequest(messages=[])) == "original"
