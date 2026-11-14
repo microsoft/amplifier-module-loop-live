@@ -8,8 +8,10 @@ import base64
 import copy
 import hashlib
 import io
+import inspect
 import json
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -267,12 +269,15 @@ async def test_actual_guarded_bridge_never_admits_live_background_media_or_repla
     ledger = JobStore(tmp_path / "jobs")
     owner.register_capability("live.jobs", ledger)
     counts = {"tool": 0, "post": 0, "process": 0}
-    original_process = owner.process_hook_result
-    async def process(result, event, *args, **kwargs):
-        if event == "tool:post":
+    native_process = owner.process_hook_result
+    assert inspect.isbuiltin(native_process) and native_process.__self__ is owner
+    # Observe the captured Rust endpoint without replacing it: newer bridges
+    # intentionally refuse Python endpoint facades. This exact-candidate probe
+    # counts native invocations, while awaited settlement below proves completion.
+    def observe_native(frame, event, callee):
+        if (event == "c_call" and callee == native_process
+                and frame.f_locals.get("event") == "tool:post"):
             counts["process"] += 1
-        return await original_process(result, event, *args, **kwargs)
-    owner.process_hook_result = process
     encoded = base64.b64encode(pixels()).decode()
     async def post(event, data):
         counts["post"] += 1
@@ -290,6 +295,9 @@ async def test_actual_guarded_bridge_never_admits_live_background_media_or_repla
     tool = Tool()
     await owner.mount("tools", tool, name=tool.name)
     call = ToolCall(id="call", name="delegate", arguments={"async": True})
+    previous_profile = sys.getprofile()
+    assert previous_profile is None, "Native-count fixture requires an unprofiled thread"
+    sys.setprofile(observe_native)
     try:
         with loop.approved_dispatch.run_scope(owner):
             await loop._execute_tool_only(call, owner.get("tools"), owner.hooks, None, owner)
@@ -311,11 +319,13 @@ async def test_actual_guarded_bridge_never_admits_live_background_media_or_repla
         assert loop.pending[0].job_result["metadata"] == {}
         await loop._execute_tool_only(call, {}, owner.hooks, None, owner)
         assert counts == {"tool": 1, "post": 1, "process": 1}
+        assert owner.process_hook_result == native_process
         assert not bridge.readiness()["authoritative"]
         for path in (tmp_path / "jobs").glob("*.json"):
             assert encoded not in path.read_text()
         assert "experimental.media.v1" not in json.dumps(ledger.rows["call"])
     finally:
+        sys.setprofile(previous_profile)
         unregister()
         ledger.close()
         store.close()
