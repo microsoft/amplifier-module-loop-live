@@ -54,6 +54,7 @@ class RootProvider:
         self.native_bundle_live = bool(getattr(provider, "native_bundle_live", False) and
                                        selection["model"] == "gpt-6-astra")
         self._request_candidate = None
+        self._media_release_candidate = None
         self._install_request_methods()
 
     def _install_request_methods(self):
@@ -94,12 +95,18 @@ class RootProvider:
         return view, kwargs
 
     def _request_budget(self, request, *, request_options=None, **kwargs):
-        request, options = self._request_view(request, request_options or {})
+        request, options = self._prepare_request_view(request, request_options)
         return optional_request_call(self.provider.request_budget, request, request_options=options, **kwargs)
 
     def _refit_request(self, request, *, request_options=None, **kwargs):
-        request, options = self._request_view(request, request_options or {})
+        request, options = self._prepare_request_view(request, request_options)
         return optional_request_call(self.provider.refit_request, request, request_options=options, **kwargs)
+
+    def _prepare_request_view(self, request, request_options):
+        caller_options = copy.deepcopy(request_options or {})
+        view, options = self._request_view(request, caller_options)
+        self._media_release_candidate = (request, view, caller_options, copy.deepcopy(options))
+        return view, options
 
     def _stream(self, request, **kwargs):
         request, kwargs = self._request_view(request, kwargs)
@@ -110,16 +117,20 @@ class RootProvider:
         return self.provider.compact_context(request, **kwargs)
 
     def _media_budget_witness(self, request, *, request_options=None):
-        request, options = self._request_view(request, request_options or {})
+        request, options = self._prepare_request_view(request, request_options)
         return self.provider.media_budget_witness(request, request_options=options)
 
     def _media_text_fallback_witness(self, request, *, request_options=None):
-        request, options = self._request_view(request, request_options or {})
+        request, options = self._prepare_request_view(request, request_options)
         return self.provider.media_text_fallback_witness(request, request_options=options)
 
     def _release_media_request(self, request, *, request_options=None):
-        request, options = self._request_view(request, request_options or {})
-        return self.provider.release_media_request(request, request_options=options)
+        candidate = self._media_release_candidate
+        if candidate is None or candidate[0] is not request or candidate[2] != (request_options or {}):
+            return False
+        # Cleanup is an identity lookup, never a new selection/conversion. The
+        # caller may have mutated its request or changed selection since count.
+        return self.provider.release_media_request(candidate[1], request_options=copy.deepcopy(candidate[3]))
 
     def _get_stream_request_support(self, *, model, request_options=None):
         options = dict(request_options or {})

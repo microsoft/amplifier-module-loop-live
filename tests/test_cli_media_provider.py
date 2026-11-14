@@ -315,6 +315,52 @@ async def test_release_forwards_exact_cached_count_candidate_and_effective_optio
         view.release_media_request(request, request_options=options)
 
 
+@pytest.mark.parametrize("wrapper", ["root", "worker"])
+@pytest.mark.parametrize("mutation", ["canonical", "selection", "copy-then-valid", "stale-then-current"])
+async def test_release_looks_up_preparation_identity_without_rebuilding_cache(wrapper, mutation):
+    from amplifier_core.message_models import ToolSpec
+    class Strict(Provider):
+        candidate = None
+        async def request_budget(self, request, *, request_options=None):
+            self.candidate = (request, copy.deepcopy(request_options or {}))
+        def release_media_request(self, request, *, request_options=None):
+            if self.candidate is None or self.candidate[0] is not request or self.candidate[1] != (request_options or {}):
+                return False
+            self.candidate = None
+            return True
+    driver = Strict()
+    view = (RootProvider(driver, selection(), "fixture") if wrapper == "root" else
+            ObservedWorkerProvider(driver, {"account": driver},
+                                   SimpleNamespace(configuration=lambda *a: None), "child"))
+    def request():
+        return ChatRequest(messages=[Message(role="user", content="refs")], tools=[
+            ToolSpec(name="computer", parameters={}, description="fixture").model_copy(update={"type": "computer"})])
+    canonical, options = request(), {"temperature": 0.25}
+    await view.request_budget(canonical, request_options=options)
+    counted, frozen = driver.candidate
+    cached = view._request_candidate
+    if mutation == "canonical":
+        canonical.messages[0].content = "changed after fitting"
+    elif mutation == "selection" and wrapper == "root":
+        view.selection = {**view.selection, "model": "changed-model", "effort": "low"}
+    elif mutation in {"copy-then-valid", "selection"}:
+        assert view.release_media_request(canonical.model_copy(deep=True), request_options=options) is False
+        assert view._request_candidate is cached
+    else:
+        old = canonical
+        canonical = request()
+        await view.request_budget(canonical, request_options=options)
+        counted, frozen = driver.candidate
+        cached = view._request_candidate
+        assert view.release_media_request(old, request_options=options) is False
+        assert view._request_candidate is cached
+    assert view.release_media_request(canonical, request_options={"temperature": 0.5}) is False
+    assert driver.candidate == (counted, frozen) and view._request_candidate is cached
+    assert view.release_media_request(canonical, request_options=options) is True
+    assert driver.candidate is None
+    assert view.release_media_request(canonical, request_options=options) is False
+
+
 @pytest.mark.parametrize("live", [False, True])
 async def test_cli_execution_registration_ends_after_late_setup_before_engine(monkeypatch, live):
     from contextlib import contextmanager

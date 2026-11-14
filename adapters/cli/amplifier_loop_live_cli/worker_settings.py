@@ -92,6 +92,7 @@ class ObservedWorkerProvider:
         self.original, self.providers, self.registry, self.identity = original, providers, registry, identity
         self.alias = None
         self._request_candidate = None
+        self._media_release_candidate = None
         for name in ("request_budget", "refit_request", "stream", "compact_context", "media_budget_witness",
                      "media_text_fallback_witness", "release_media_request"):
             if callable(getattr(original, name, None)):
@@ -125,27 +126,35 @@ class ObservedWorkerProvider:
 
     def _request_budget(self, request, *, request_options=None, **kwargs):
         from amplifier_loop_live_cli.selection import optional_request_call
-        return optional_request_call(self.original.request_budget, self._request_view(request),
+        return optional_request_call(self.original.request_budget, self._prepare_request_view(request, request_options),
                                      request_options=request_options, **kwargs)
 
     def _refit_request(self, request, *, request_options=None, **kwargs):
         from amplifier_loop_live_cli.selection import optional_request_call
-        return optional_request_call(self.original.refit_request, self._request_view(request),
+        return optional_request_call(self.original.refit_request, self._prepare_request_view(request, request_options),
                                      request_options=request_options, **kwargs)
+
+    def _prepare_request_view(self, request, request_options):
+        view = self._request_view(request)
+        self._media_release_candidate = (request, view, copy.deepcopy(request_options or {}))
+        return view
 
     def _compact_context(self, request, **kwargs):
         return self.original.compact_context(self._request_view(request), **kwargs)
 
-    def _media_budget_witness(self, request, **kwargs):
-        return self.original.media_budget_witness(self._request_view(request), **kwargs)
+    def _media_budget_witness(self, request, *, request_options=None):
+        return self.original.media_budget_witness(self._prepare_request_view(request, request_options),
+                                                  request_options=request_options)
 
     def _media_text_fallback_witness(self, request, *, request_options=None):
-        return self.original.media_text_fallback_witness(self._request_view(request),
+        return self.original.media_text_fallback_witness(self._prepare_request_view(request, request_options),
                                                         request_options=request_options)
 
     def _release_media_request(self, request, *, request_options=None):
-        return self.original.release_media_request(self._request_view(request),
-                                                   request_options=request_options)
+        candidate = self._media_release_candidate
+        if candidate is None or candidate[0] is not request or candidate[2] != (request_options or {}):
+            return False
+        return self.original.release_media_request(candidate[1], request_options=copy.deepcopy(candidate[2]))
 
     def _stream(self, request, **kwargs):
         self.registry.configuration(self.identity, self._selection(request, kwargs))

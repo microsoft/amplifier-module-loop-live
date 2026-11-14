@@ -125,7 +125,8 @@ class Owner:
 
 @pytest.mark.parametrize("wrapper", ["root", "worker-foreign-tools", "worker-ordinary-tools"])
 @pytest.mark.parametrize("boundary", ["complete", "stream"])
-async def test_actual_f1_text_fallback_uses_same_selected_view_as_dispatch(tmp_path, wrapper, boundary):
+@pytest.mark.parametrize("preparation", ["fallback", "count"])
+async def test_actual_f1_text_fallback_uses_same_selected_view_as_dispatch(tmp_path, wrapper, boundary, preparation):
     """Fallback is not a provider count; bind its selected warning-only candidate."""
     from amplifier_core.message_models import ToolSpec
     owner, observed = Owner([]), []
@@ -134,6 +135,10 @@ async def test_actual_f1_text_fallback_uses_same_selected_view_as_dispatch(tmp_p
                               config={"session": {"orchestrator": "loop-live"}})
     host = install_session_media(session, native)
     class Selected(Provider):
+        async def request_budget(self, request, *, context_estimate=None, request_options=None):
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 100,
+                    "context_token_budget": 100, "measurement": {
+                        "kind": "provider_count", "source": "offline synthetic owner", "input_tokens": 10}}
         def observe(self, request, kwargs):
             host.capability.validate(request, purpose="transport", request_options=kwargs)
             assert all(not isinstance(block, ImageBlock) for message in request.messages
@@ -148,7 +153,9 @@ async def test_actual_f1_text_fallback_uses_same_selected_view_as_dispatch(tmp_p
     driver = Selected()
     owner.providers["selected-account"] = driver
     tools = [ToolSpec(name="computer", parameters={}, description="offline fixture")]
-    if wrapper == "worker-foreign-tools":
+    if preparation == "fallback":
+        tools = []  # A messages-only local estimate must not omit tool schemas.
+    elif wrapper == "worker-foreign-tools":
         tools[0] = tools[0].model_copy(update={"type": "computer"})
     canonical = ChatRequest(messages=[Message(role="user", content=[{
         "type": "image", "source": {"type": "base64", "media_type": "image/png",
@@ -163,9 +170,14 @@ async def test_actual_f1_text_fallback_uses_same_selected_view_as_dispatch(tmp_p
     view = CLIHostAdapter().prepare_provider(raw, owner)
     options = {"temperature": 0.3}
     try:
-        witness = await view.media_text_fallback_witness(canonical, request_options=options)
-        assert witness["validated"] is True
-        assert "Image unavailable" in str(witness["messages"])
+        if preparation == "fallback":
+            witness = await view.media_text_fallback_witness(canonical, request_options=options)
+            assert witness["validated"] is True
+            assert "Image unavailable" in str(witness["messages"])
+        else:
+            # Full request counting retains all converted tool schemas. New
+            # Foundation correctly refuses a messages-only fallback with tools.
+            await view.request_budget(canonical, request_options=options)
         prepared = host.wrappers[id(driver)][1]
         private_id = id(prepared._candidate.prepared.request)
         if boundary == "complete":
@@ -174,11 +186,70 @@ async def test_actual_f1_text_fallback_uses_same_selected_view_as_dispatch(tmp_p
             assert [chunk async for chunk in view.stream(canonical, **options)] == ["done"]
         assert len(observed) == 1 and observed[0][0] == private_id
         assert observed[0][1] == ("selected-model" if wrapper == "root" else None)
-        assert getattr(observed[0][2][0], "type", "function") == "function"
+        assert all(getattr(tool, "type", "function") == "function" for tool in observed[0][2] or [])
         assert observed[0][3] == ({**options, "model": "selected-model", "reasoning_effort": "high"}
                                   if wrapper == "root" else options)
         assert canonical.model_dump() == before
         assert prepared._candidate is None
+    finally:
+        await owner.cleanup()
+
+
+@pytest.mark.parametrize("wrapper", ["root", "worker-foreign-tools"])
+@pytest.mark.parametrize("mutation", ["canonical", "selection", "copy-then-valid", "stale-then-current"])
+async def test_actual_f1_release_preserves_preparation_time_selected_binding(tmp_path, wrapper, mutation):
+    from amplifier_core.message_models import ToolSpec
+    from amplifier_foundation.session.media_provider import MediaPreparedProvider
+    if not hasattr(MediaPreparedProvider, "release_media_request"):
+        pytest.skip("Requires the exact candidate-release Foundation API")
+    class Counted(Provider):
+        async def request_budget(self, request, *, context_estimate=None, request_options=None):
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 100,
+                    "context_token_budget": 100, "measurement": {
+                        "kind": "provider_count", "source": "offline synthetic owner", "input_tokens": 10}}
+    owner, driver = Owner([]), Counted()
+    session = SimpleNamespace(session_id="root", coordinator=owner,
+                              config={"session": {"orchestrator": "loop-live"}})
+    host = install_session_media(session, SessionStore(tmp_path / "sessions"))
+    owner.providers["account"] = driver
+    if wrapper == "root":
+        raw = RootProvider(driver, {"instance": "account", "model": "selected-model",
+                                   "effort": "high", "thinkingBudget": None}, "fixture")
+    else:
+        raw = ObservedWorkerProvider(driver, {"account": driver},
+                                     SimpleNamespace(configuration=lambda *a: None), "child")
+    view = CLIHostAdapter().prepare_provider(raw, owner)
+    prepared = host.wrappers[id(driver)][1]
+    def request():
+        return ChatRequest(messages=[Message(role="user", content=[{
+            "type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                      "data": base64.b64encode(pixels()).decode()}}])],
+            tools=[ToolSpec(name="computer", parameters={}, description="fixture").model_copy(update={"type": "computer"})])
+    canonical, options = request(), {"temperature": 0.3}
+    try:
+        await view.request_budget(canonical, request_options=options)
+        candidate = prepared._candidate
+        if mutation == "canonical":
+            canonical.messages[0].content = "mutated after preparation"
+        elif mutation == "selection" and wrapper == "root":
+            view.selection = {**view.selection, "model": "later-model", "effort": "low"}
+        elif mutation in {"copy-then-valid", "selection"}:
+            assert view.release_media_request(canonical.model_copy(deep=True), request_options=options) is False
+            assert prepared._candidate is candidate
+        else:
+            old = canonical
+            canonical = request()
+            await view.request_budget(canonical, request_options=options)
+            candidate = prepared._candidate
+            assert view.release_media_request(old, request_options=options) is False
+            assert prepared._candidate is candidate
+        assert view.release_media_request(canonical, request_options={"temperature": 0.5}) is False
+        assert prepared._candidate is candidate
+        assert view.release_media_request(canonical, request_options=options) is True
+        assert prepared._candidate is None and prepared._active == [] and prepared._lifetimes == []
+        assert candidate.prepared.request.messages == []
+        assert view.release_media_request(canonical, request_options=options) is False
+        assert driver.requests == []
     finally:
         await owner.cleanup()
 
