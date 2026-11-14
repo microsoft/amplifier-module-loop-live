@@ -42,7 +42,7 @@ def image_bytes(format):
 
 
 @pytest.mark.parametrize("format", ["PNG", "JPEG"])
-@pytest.mark.parametrize("mode", ["keep", "null", "redact", "error", "continue-null-echo"])
+@pytest.mark.parametrize("mode", ["keep", "null", "redact", "error", "continue-null-echo", "cancel"])
 async def test_public_positive_background_result_checkpoint_and_private_send(tmp_path, format, mode):
     """No private observer and no dictionary masquerading as a bridge receipt."""
     config = {"session": {"orchestrator": {"module": "loop-live"},
@@ -73,10 +73,14 @@ async def test_public_positive_background_result_checkpoint_and_private_send(tmp
     effective_refs, observed = [], []
     pixels = image_bytes(format)
     encoded = base64.b64encode(pixels).decode()
+    post_entered = asyncio.Event()
 
     async def post(event, data):
         counts["post"] += 1
         assert encoded not in json.dumps(data)
+        if mode == "cancel":
+            post_entered.set()
+            await asyncio.Event().wait()
         if mode == "error":
             raise ValueError("declared fixture callback failed")
         if mode == "null":
@@ -145,7 +149,18 @@ async def test_public_positive_background_result_checkpoint_and_private_send(tmp
         with loop.approved_dispatch.run_scope(view):
             pending = await loop._execute_tool_only(call, owner.get("tools"), view.hooks, None, view)
             job_id, job = next(iter(loop.jobs.items()))
+            if mode == "cancel":
+                await asyncio.wait_for(post_entered.wait(), 3)
+                loop.cancel_job(job)
             await job["task"]
+        if mode == "cancel":
+            assert counts == {"tool": 1, "post": 1, "process": 0}
+            assert ledger.rows[call.id]["status"] == "cancelled"
+            assert MEDIA not in json.dumps(ledger.rows[call.id]) and observed == []
+            await loop._execute_tool_only(call, {}, view.hooks, None, view)
+            assert counts == {"tool": 1, "post": 1, "process": 0}
+            assert bridge.validate_receipt(receipt)
+            return
         assert counts == {"tool": 1, "post": 1, "process": 1}
         saved = ledger.rows[call.id]["settled_result"]
         assert ledger.rows[call.id]["status"] == "returned"
@@ -179,6 +194,14 @@ async def test_public_positive_background_result_checkpoint_and_private_send(tmp
         assert observed[0][1] == observed[1][1]
         assert observed[0][2] == observed[1][2] == [ref["sha256"] for ref in row_refs]
         assert request.model_dump() == before and await context.get_messages() == canonical
+        if mode == "keep":
+            changed = ChatRequest(messages=[Message(**row) for row in rows])
+            await prepared.request_budget(changed)
+            changed.messages[0].content = "changed after fitting"
+            with pytest.raises(ValueError, match="changed before dispatch"):
+                await prepared.complete(changed)
+            assert sum(purpose == "transport" for purpose, *_ in observed) == 1
+            assert await context.get_messages() == canonical
         assert encoded not in json.dumps(native.load(session.session_id)[0])
         assert encoded not in json.dumps(ledger.rows[call.id])
         await loop._execute_tool_only(call, {}, view.hooks, None, view)
