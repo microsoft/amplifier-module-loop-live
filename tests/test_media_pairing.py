@@ -625,3 +625,94 @@ async def test_live_tool_mount_without_canonical_ack_refuses_without_raw_reattac
         await loop._mount_live_tools(tools, coordinator)
     mount.assert_awaited_once()
     assert tools == {}
+
+
+@pytest.mark.parametrize("shape", ["valid", "async", "absent", "bool-version", "missing-operation",
+                                   "no-boundary", "false-boundary"])
+async def test_registered_consumer_report_is_compatibility_only(shape):
+    from amplifier_module_loop_live.host import report_media_consumer_ready
+    reports = []
+    media = Media()
+    media.enabled = False
+    def report(*args, **kwargs):
+        reports.append((args, kwargs))
+        return {"authoritative": False}
+    async def report_async(*args, **kwargs):
+        await asyncio.sleep(0)
+        return report(*args, **kwargs)
+    media.report = report_async if shape == "async" else report
+    if shape == "bool-version":
+        media.version = True
+    if shape == "missing-operation":
+        media.publish = None
+    caps = {MEDIA: media, "session.media.tool_post": lambda *a, **kw: pytest.fail("Do not invoke post speculatively")}
+    if shape == "absent":
+        caps.pop(MEDIA)
+    if shape == "no-boundary":
+        caps.pop("session.media.tool_post")
+    if shape == "false-boundary":
+        caps["session.media.tool_post"] = False
+    await report_media_consumer_ready(SimpleNamespace(get_capability=caps.get))
+    assert len(reports) == int(shape in {"valid", "async"})
+    if reports:
+        assert reports == [(("loop-live",), {"event": "consumer-ready", "outcome": "ready",
+                                            "details": {"contract": 1, "role": "loop", "phase": "registered"}})]
+    assert media.enabled is False  # Only the host may qualify/enable its graph.
+
+
+@pytest.mark.parametrize("outcome", ["release", "error", "cancel"])
+async def test_live_consumer_report_settles_before_readiness_with_terminal_cleanup(outcome):
+    from amplifier_core import AmplifierSession
+    from test_loop import NativeProvider
+    runtime, entered, release = Runtime(), asyncio.Event(), asyncio.Event()
+    session = AmplifierSession({"session": {"orchestrator": "loop-live", "context": "context-simple"},
+                                "providers": []})
+    await session.initialize()
+    owner, media = session.coordinator, Media()
+    provider = NativeProvider(runtime)
+    provider.close_live = AsyncMock()
+    calls = []
+    async def report(*args, **kwargs):
+        calls.append((args, kwargs))
+        assert owner.get("tools", "live_job") is not None
+        entered.set()
+        await release.wait()
+        if outcome == "error":
+            raise RuntimeError("compatibility report acknowledgment failed")
+        return {"authoritative": False}
+    media.report = report
+    owner.register_capability(MEDIA, media)
+    owner.register_capability("session.media.tool_post", lambda *a, **kw: pytest.fail("No speculative post"))
+    owner.register_capability("live.runtime", runtime)
+    await owner.mount("providers", provider, name="fixture")
+    loop = owner.get("orchestrator")
+    task = asyncio.create_task(loop.execute("", owner.get("context"), owner.get("providers"),
+                                           owner.get("tools"), owner.hooks, owner))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert not provider.requests.qsize()
+        assert not any(event["type"] == "session.ready" for event in runtime.events)
+        if outcome == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif outcome == "error":
+            release.set()
+            with pytest.raises(RuntimeError, match="report acknowledgment failed"):
+                await task
+        else:
+            release.set()
+            await runtime.wait_for(lambda event: event["type"] == "session.ready", 2)
+            await runtime.submit(Input("stop"))
+            await task
+        assert len(calls) == 1 and not provider.requests.qsize()
+        assert not loop.running and loop.runtime is None and runtime.closed
+        provider.close_live.assert_awaited_once()
+        if outcome != "release":
+            assert not any(event["type"] == "session.ready" for event in runtime.events)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await session.cleanup()

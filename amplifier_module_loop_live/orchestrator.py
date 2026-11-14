@@ -21,7 +21,7 @@ from .runtime import Input, observation
 from .provenance import InputContext, ContinuationContext, input_metadata
 from .job_store import apply_result, result_fields, settled_record
 from .host import (HostAdapter, AttachmentContext, attachment_content,
-                   attachment_message, checkpoint_attachment)
+                   attachment_message, checkpoint_attachment, report_media_consumer_ready)
 from .scope import HOST_ADAPTER
 from .failures import ManagerTurnError, turn_failure
 from .dispatch import ApprovedDispatch
@@ -433,6 +433,11 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             await self._mount_live_tools(tools, coordinator)
             if registration_ready:
                 registration_ready()
+            # Initial attachment encoding precedes the streaming goal. Publish
+            # its existing compatibility report only after late registration
+            # has closed and the actual post boundary is installed. This is
+            # not a graph receipt: admission remains the host issuer's decision.
+            await report_media_consumer_ready(coordinator)
             await runtime.emit("session.ready", mode="configured_bundle", native=bool(native),
                 steering="native" if native else "request_boundary", async_tools="native" if native else "delegate_job_handles" if
                 self.config.get("background_delegate") else "none",

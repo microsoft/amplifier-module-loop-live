@@ -38,6 +38,17 @@ async def checkpoint_attachment(message, coordinator):
         await checkpoint_settled_results(coordinator, has_media=True)
 
 
+async def report_media_consumer_ready(coordinator):
+    """Report installed consumer compatibility, never completed post-hook work."""
+    from amplifier_module_loop_streaming.media import capability, tool_post_boundary
+    cap = capability(coordinator)
+    if cap is not None and tool_post_boundary(coordinator) is not None:
+        result = cap.report("loop-live", event="consumer-ready", outcome="ready",
+                            details={"contract": 1, "role": "loop", "phase": "registered"})
+        if inspect.isawaitable(result):
+            await result
+
+
 class HostAdapter:
     def execution_registration(self, coordinator, hooks):
         """Own registration only; never span provider/tool execution."""

@@ -494,6 +494,113 @@ async def test_actual_cli_raw_finite_child_and_cold_resume_use_fresh_media_owner
 
 
 @pytest.mark.parametrize("format", ["PNG", "JPEG"])
+async def test_live_first_upload_reports_consumer_before_ingest_and_goal(tmp_path, format):
+    """A readiness-gated host still requires its actual issuer receipt to ingest.
+
+    The gate models the host's compatibility dependency, not its graph issuer.
+    Actual image storage, canonical save ACK and private request projection run.
+    """
+    from amplifier_app_cli.session_hooks import install_session_hook_graph
+    from amplifier_core.message_models import ChatResponse, TextBlock
+    from amplifier_module_loop_live.runtime import Input
+    session = AmplifierSession({"session": {"orchestrator": {"module": "loop-live", "config": {
+        "min_delay_between_calls_ms": 0}}, "context": "context-simple"},
+        "providers": [], "session_media": POLICY})
+    graph = install_session_hook_graph(session, owner="offline.live.first-upload",
+                                      host_participants=("host.media",))
+    native = SessionStore(tmp_path / "sessions")
+    host = install_session_media(session, native)
+    install_session_checkpoint(session, native, session_id=session.session_id)
+    owner, order, reports, requests = session.coordinator, [], [], []
+    bridge = owner.get_capability("session.media.tool_post")
+    payload = image_bytes(format)
+    class GatedConsumer:
+        def __getattr__(self, name):
+            return getattr(host.capability, name)
+        def report(self, origin, **kwargs):
+            result = host.capability.report(origin, **kwargs)
+            if kwargs["event"] == "consumer-ready":
+                assert bridge.validate_receipt(bridge.graph_receipt)
+                assert not requests and not order
+                reports.append(result)
+                order.append("consumer-ready")
+            return result
+        async def ingest(self, *args, **kwargs):
+            assert reports and bridge.validate_receipt(bridge.graph_receipt)
+            assert not requests  # Attachment encoding precedes the first goal.
+            order.append("ingest")
+            return await host.capability.ingest(*args, **kwargs)
+    gate = GatedConsumer()
+    owner.register_capability(MEDIA, gate)
+    await session.initialize()
+    context = owner.get("context")
+    class Selected(Provider):
+        def get_media_request_support(self, **kwargs):
+            return {"v": 1, "positions": ["user"]}
+        async def request_budget(self, request, *, request_options=None, **kwargs):
+            order.append("count")
+            if any(isinstance(block, ImageBlock) for message in request.messages
+                   for block in message.content if isinstance(message.content, list)):
+                saved_user = next(row for row in native.load(session.session_id)[0]
+                                  if (row.get("metadata") or {}).get("amplifier_input", {}).get("id") == "first-upload")
+                assert (saved_user.get("metadata") or {}).get(MEDIA, {}).get("refs"), saved_user
+                assert saved_user["metadata"][MEDIA]["refs"][0]["sha256"] == hashlib.sha256(payload).hexdigest()
+            host.capability.validate(request, purpose="count", request_options=request_options)
+            self.counted = request
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 10000,
+                    "context_token_budget": 10000, "measurement": {
+                        "kind": "provider_count", "source": "offline fixture", "input_tokens": 10}}
+        async def complete(self, request, **kwargs):
+            order.append("send")
+            assert request is self.counted and bridge.validate_receipt(bridge.graph_receipt)
+            hashes = [hashlib.sha256(base64.b64decode(block.source["data"])).hexdigest()
+                      for message in request.messages
+                      for block in message.content if isinstance(message.content, list)
+                      if isinstance(block, ImageBlock)]
+            requests.append(hashes)
+            return ChatResponse(content=[TextBlock(text="first upload received")])
+    async def encode(command, coordinator):
+        assert order == ["consumer-ready"]
+        origin = {"kind": "upload", "session_id": session.session_id, "id": command.id}
+        ref = (await gate.ingest(payload, source_format="image-bytes", origin=origin, policy=None))["value"]
+        await gate.publish([ref], origin=origin, disposition="retain")
+        return {"content": command.text, "metadata": {MEDIA: {"refs": [ref]}}}
+    class UploadHost(CLIHostAdapter):
+        def content(self, command, coordinator):
+            # Explicit host encoder, not the CLI's path/mention upload parser.
+            # CLI registration and selected-provider preparation stay actual.
+            return encode(command, coordinator)
+    runtime = Runtime()
+    owner.register_capability("live.runtime", runtime)
+    owner.register_capability("live.host", UploadHost())
+    await graph.coordinator("host.media").mount("providers", Selected(), name="fixture")
+    task = asyncio.create_task(session.execute(""))
+    try:
+        await runtime.wait_for(lambda event: event["type"] == "session.ready", 3)
+        assert order == ["consumer-ready"] and reports[0]["authoritative"] is False
+        assert not requests and bridge.validate_receipt(bridge.graph_receipt)
+        await runtime.submit(Input("user", "first image", id="first-upload", attachments=("upload",)))
+        terminal = await runtime.wait_for(lambda event: event["type"] in {"generation.finished", "generation.failed"}, 3)
+        assert terminal["type"] == "generation.finished", json.dumps(
+            {"terminal": terminal, "order": order, "events": runtime.events})
+        assert requests == [[hashlib.sha256(payload).hexdigest()]]
+        assert order.index("consumer-ready") < order.index("ingest") < order.index("count") < order.index("send")
+        saved = native.load(session.session_id)[0]
+        rows = await context.get_messages()
+        assert saved and saved == rows[:len(saved)]
+        assert next(row for row in saved if (row.get("metadata") or {}).get("amplifier_input", {}).get(
+            "id") == "first-upload")["metadata"][MEDIA]["refs"]
+        assert base64.b64encode(payload).decode() not in json.dumps(saved)
+        await runtime.submit(Input("stop"))
+        await asyncio.wait_for(task, 3)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await session.cleanup()
+
+
+@pytest.mark.parametrize("format", ["PNG", "JPEG"])
 @pytest.mark.parametrize("wrapper", ["root", "worker"])
 @pytest.mark.parametrize("abandonment", ["manual", "engine-refusal", "engine-cancel", "engine-suspend",
                                        "nested-refusal", "nested-revoke", "nested-cancel", "nested-hold"])
