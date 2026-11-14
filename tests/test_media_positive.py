@@ -351,9 +351,8 @@ async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_pa
         ledger.close()
         await session.cleanup()
         assert old_host.closed
-        # Distinct actual Core session and issuer-owned generation. Actual CLI
-        # saved-row restoration acknowledges disk; no old wrapper/cache/receipt
-        # is inherited and the reconciled job must not execute again.
+        # Fresh real Core session restores saved rows and reopens the ledger,
+        # never reusing the prior private candidate or receipt.
         session = AmplifierSession(config, session_id=session.session_id, parent_id=parent_id)
         owner = session.coordinator
         if cli_graph:
@@ -396,3 +395,99 @@ async def test_controlled_live_manager_late_seal_actual_engine_media_send(tmp_pa
         await asyncio.gather(task, return_exceptions=True)
         ledger.close()
         await session.cleanup()
+
+
+@pytest.mark.parametrize("format", ["PNG", "JPEG"])
+async def test_actual_cli_raw_finite_child_and_cold_resume_use_fresh_media_owner(tmp_path, monkeypatch, format):
+    """Real spawner functions and Core loader, synthetic provider, selected history."""
+    from unittest.mock import MagicMock
+    from amplifier_core import ProviderInfo
+    from amplifier_core.message_models import ChatResponse, TextBlock
+    from amplifier_app_cli import session_spawner, session_store, paths
+    from amplifier_app_cli.lib import settings as settings_module
+    from amplifier_app_cli.session_hooks import install_session_hook_graph
+    from amplifier_module_loop_live.scope import HOST_ADAPTER
+    native = SessionStore(tmp_path / "sessions")
+    observed, mounts, receipts = [], [], []
+    payload = image_bytes(format)
+    expected = hashlib.sha256(payload).hexdigest()
+    class Selected:
+        name, default_model, config = "fixture", "fixture", {}
+        def get_info(self):
+            return ProviderInfo(id="fixture", display_name="Offline", capabilities=[],
+                                defaults={"model": "fixture"})
+        def get_media_request_support(self, **kwargs):
+            return {"v": 1, "positions": ["user"]}
+        async def request_budget(self, request, **kwargs):
+            self.counted = request
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 10000,
+                    "context_token_budget": 10000, "measurement": {
+                        "kind": "provider_count", "source": "offline synthetic owner", "input_tokens": 10}}
+        async def complete(self, request, **kwargs):
+            assert request is self.counted
+            bridge = self.owner.get_capability("session.media.tool_post")
+            assert bridge.validate_receipt(bridge.graph_receipt)
+            receipts.append(bridge.graph_receipt)
+            hashes = [hashlib.sha256(base64.b64decode(block.source["data"])).hexdigest()
+                      for message in request.messages
+                      for block in message.content if isinstance(message.content, list)
+                      if isinstance(block, ImageBlock)]
+            observed.append((self.owner.session_id, hashes, request))
+            return ChatResponse(content=[TextBlock(text="child done")])
+        def parse_tool_calls(self, response):
+            return []
+    module_name = "amplifier_module_provider_live_child_fixture"
+    module = ModuleType(module_name)
+    module.__file__, module.__spec__ = __file__, ModuleSpec(module_name, loader=None, origin=__file__)
+    async def mount(current, config=None):
+        provider = Selected()
+        provider.owner = current
+        mounts.append((current, provider))
+        await current.mount("providers", provider, name="fixture")
+    module.mount = mount
+    monkeypatch.setitem(sys.modules, module_name, module)
+    plan = {"session": {"orchestrator": {"module": "loop-live", "config": {
+        "min_delay_between_calls_ms": 0}}, "context": {"module": "context-simple"}},
+        "providers": [{"module": "provider-live-child-fixture"}], "session_media": POLICY}
+    parent = AmplifierSession(plan, session_id="parent")
+    install_session_hook_graph(parent, owner="offline.parent.selected-history",
+                               host_participants=("host.media",))
+    host = install_session_media(parent, native)
+    install_session_checkpoint(parent, native, session_id="parent")
+    await parent.initialize()
+    origin = {"kind": "upload", "session_id": "parent", "id": "selected-upload"}
+    ref = (await host.capability.ingest(payload, source_format="image-bytes", origin=origin, policy=None))["value"]
+    await host.capability.publish([ref], origin=origin, disposition="retain")
+    selected = [{"role": "user", "content": "selected observation", "metadata": {MEDIA: {"refs": [ref]}}}]
+    await parent.coordinator.get("context").set_messages(selected)
+    await parent.coordinator.get_capability("session.durable_checkpoint")()
+    settings = MagicMock()
+    settings.get_config_overrides.return_value = {}
+    settings.get_provider_overrides.return_value = []
+    settings.get_notification_hook_overrides.return_value = []
+    monkeypatch.setattr(settings_module, "AppSettings", lambda: settings)
+    monkeypatch.setattr(session_store, "SessionStore", lambda: native)
+    monkeypatch.setattr(paths, "create_foundation_resolver", lambda: None)
+    monkeypatch.setattr(session_spawner, "_expand_system_instruction", __import__("unittest.mock").mock.AsyncMock(
+        side_effect=lambda text, _: text))
+    monkeypatch.setenv("AMPLIFIER_SPAWN_CHECKPOINT_INTERVAL_S", "-1")
+    token = HOST_ADAPTER.set(CLIHostAdapter())
+    try:
+        result = await session_spawner.spawn_sub_session(agent_name="named", instruction="inspect selected",
+            parent_session=parent, agent_configs={"named": {}}, sub_session_id="child", parent_messages=selected)
+        assert result["output"] == "child done"
+        first_host = mounts[-1][0].get_capability("cli.session_media")
+        assert first_host.closed
+        await parent.cleanup()
+        resumed = await session_spawner.resume_sub_session("child", "follow-up", parent_session=None)
+        assert resumed["output"] == "child done"
+        assert len(observed) == 2 and all(row[0] == "child" and row[1] == [expected] for row in observed)
+        assert receipts[0] is not receipts[1] and observed[0][2] is not observed[1][2]
+        child_rows = native.load("child")[0]
+        child_ref = next(row for row in child_rows if (row.get("metadata") or {}).get(MEDIA))["metadata"][MEDIA]["refs"][0]
+        assert child_ref["session_id"] == "child" and child_ref["sha256"] == ref["sha256"]
+        assert selected[0]["metadata"][MEDIA]["refs"][0]["session_id"] == "parent"
+        assert base64.b64encode(payload).decode() not in json.dumps(child_rows)
+    finally:
+        HOST_ADAPTER.reset(token)
+        await parent.cleanup()

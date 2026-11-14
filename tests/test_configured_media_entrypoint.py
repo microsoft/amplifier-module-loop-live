@@ -24,7 +24,7 @@ from test_media_positive import image_bytes, POLICY
 
 
 @pytest.mark.parametrize("format", ["PNG", "JPEG"])
-@pytest.mark.parametrize("failure", [None, "before-initialize", "after-initialize"])
+@pytest.mark.parametrize("failure", [None, "before-initialize", "after-initialize", "saved-disable"])
 async def test_configured_root_owns_preinit_graph_media_and_failure_cleanup(tmp_path, monkeypatch, format, failure):
     from amplifier_loop_live_cli import configured, provider_imports, selection
     from amplifier_app_cli import session_runner, session_store
@@ -41,8 +41,9 @@ async def test_configured_root_owns_preinit_graph_media_and_failure_cleanup(tmp_
     workspace_config.load_config = lambda: SimpleNamespace(bundle="fixture")
     monkeypatch.setitem(sys.modules, workspace_module.__name__, workspace_module)
     monkeypatch.setitem(sys.modules, workspace_config.__name__, workspace_config)
+    saved_settings = {"disabled": {"tools": ["image_fixture"]}} if failure == "saved-disable" else {}
     settings = SimpleNamespace(get_active_bundle=lambda: "fixture", get_app_bundles=lambda: [],
-                               get_merged_settings=lambda: {"configurator": {}})
+                               get_merged_settings=lambda: {"configurator": copy.deepcopy(saved_settings)})
     monkeypatch.setattr(settings_module, "AppSettings", lambda: settings)
     native = session_store.SessionStore(tmp_path / "sessions")
     monkeypatch.setattr(session_store, "SessionStore", lambda: native)
@@ -130,7 +131,7 @@ async def test_configured_root_owns_preinit_graph_media_and_failure_cleanup(tmp_
     task = None
     token = configured.APPROVAL_CHANNEL.set(None)
     try:
-        if failure:
+        if failure in {"before-initialize", "after-initialize"}:
             with pytest.raises(RuntimeError, match="fixture .* initialization failed"):
                 await configured.prepare_manager(tmp_path, runtime=runtime, bundle="fixture", report_dir=tmp_path / "reports")
             assert len(created) == 1 and media_owners[0].closed
@@ -144,6 +145,11 @@ async def test_configured_root_owns_preinit_graph_media_and_failure_cleanup(tmp_
         task = asyncio.create_task(actual.execute(""))
         await runtime.wait_for(lambda event: event["type"] == "session.ready", 3)
         assert bridge.validate_receipt(bridge.graph_receipt)
+        if failure == "saved-disable":
+            assert "image_fixture" not in owner.get("tools") and calls == []
+            await runtime.submit(Input("stop"))
+            await asyncio.wait_for(task, 3)
+            return
         await runtime.submit(Input("user", "produce fixture image"))
         await asyncio.wait_for(sent.wait(), 5)
         rows, _ = native.load(runtime.session_id)
