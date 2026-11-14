@@ -261,6 +261,15 @@ def test_stream_request_support_is_forwarded_only_from_actual_provider_with_sele
                                             "reasoning_effort": "high"})]
 
 
+@pytest.mark.parametrize("wrapper", ["root", "worker"])
+def test_fallback_witness_stays_absent_without_actual_provider_method(wrapper):
+    driver = Provider()
+    view = (RootProvider(driver, selection(), "fixture") if wrapper == "root" else
+            ObservedWorkerProvider(driver, {"account": driver},
+                                   SimpleNamespace(configuration=lambda *a: None), "child"))
+    assert not hasattr(view, "media_text_fallback_witness")
+
+
 async def test_all_mounted_aliases_are_prepared_before_later_pin_or_utility_selection(monkeypatch):
     drivers = {"first": Provider(), "second": Provider()}
     views = {name: Provider() for name in drivers}

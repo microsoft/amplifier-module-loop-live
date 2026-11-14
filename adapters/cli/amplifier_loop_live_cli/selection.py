@@ -59,7 +59,8 @@ class RootProvider:
     def _install_request_methods(self):
         # Optional methods must remain genuinely optional, and must apply the
         # same selected model/options before private projection as complete().
-        for name in ("request_budget", "refit_request", "stream", "compact_context", "media_budget_witness"):
+        for name in ("request_budget", "refit_request", "stream", "compact_context", "media_budget_witness",
+                     "media_text_fallback_witness"):
             if callable(getattr(self.provider, name, None)):
                 setattr(self, name, getattr(self, "_" + name))
         if (callable(getattr(self.provider, "stream", None))
@@ -111,6 +112,10 @@ class RootProvider:
     def _media_budget_witness(self, request, *, request_options=None):
         request, options = self._request_view(request, request_options or {})
         return self.provider.media_budget_witness(request, request_options=options)
+
+    def _media_text_fallback_witness(self, request, *, request_options=None):
+        request, options = self._request_view(request, request_options or {})
+        return self.provider.media_text_fallback_witness(request, request_options=options)
 
     def _get_stream_request_support(self, *, model, request_options=None):
         options = dict(request_options or {})

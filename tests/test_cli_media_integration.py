@@ -121,6 +121,66 @@ class Owner:
             await cleanup()
 
 
+@pytest.mark.parametrize("wrapper", ["root", "worker-foreign-tools", "worker-ordinary-tools"])
+@pytest.mark.parametrize("boundary", ["complete", "stream"])
+async def test_actual_f1_text_fallback_uses_same_selected_view_as_dispatch(tmp_path, wrapper, boundary):
+    """Fallback is not a provider count; bind its selected warning-only candidate."""
+    from amplifier_core.message_models import ToolSpec
+    owner, observed = Owner([]), []
+    native = SessionStore(tmp_path / "sessions")
+    session = SimpleNamespace(session_id="root", coordinator=owner,
+                              config={"session": {"orchestrator": "loop-live"}})
+    host = install_session_media(session, native)
+    class Selected(Provider):
+        def observe(self, request, kwargs):
+            host.capability.validate(request, purpose="transport", request_options=kwargs)
+            assert all(not isinstance(block, ImageBlock) for message in request.messages
+                       for block in message.content if isinstance(message.content, list))
+            observed.append((id(request), request.model, request.tools, copy.deepcopy(kwargs)))
+        async def complete(self, request, **kwargs):
+            self.observe(request, kwargs)
+            return "done"
+        async def stream(self, request, **kwargs):
+            self.observe(request, kwargs)
+            yield "done"
+    driver = Selected()
+    owner.providers["selected-account"] = driver
+    tools = [ToolSpec(name="computer", parameters={}, description="offline fixture")]
+    if wrapper == "worker-foreign-tools":
+        tools[0] = tools[0].model_copy(update={"type": "computer"})
+    canonical = ChatRequest(messages=[Message(role="user", content=[{
+        "type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                    "data": base64.b64encode(pixels()).decode()}}])], tools=tools)
+    before = canonical.model_dump()
+    if wrapper == "root":
+        raw = RootProvider(driver, {"instance": "selected-account", "model": "selected-model",
+                                    "effort": "high", "thinkingBudget": None}, "fixture")
+    else:
+        raw = ObservedWorkerProvider(driver, {"selected-account": driver},
+                                     SimpleNamespace(configuration=lambda *a: None), "child")
+    view = CLIHostAdapter().prepare_provider(raw, owner)
+    options = {"temperature": 0.3}
+    try:
+        witness = await view.media_text_fallback_witness(canonical, request_options=options)
+        assert witness["validated"] is True
+        assert "Image unavailable" in str(witness["messages"])
+        prepared = host.wrappers[id(driver)][1]
+        private_id = id(prepared._candidate.prepared.request)
+        if boundary == "complete":
+            assert await view.complete(canonical, **options) == "done"
+        else:
+            assert [chunk async for chunk in view.stream(canonical, **options)] == ["done"]
+        assert len(observed) == 1 and observed[0][0] == private_id
+        assert observed[0][1] == ("selected-model" if wrapper == "root" else None)
+        assert getattr(observed[0][2][0], "type", "function") == "function"
+        assert observed[0][3] == ({**options, "model": "selected-model", "reasoning_effort": "high"}
+                                  if wrapper == "root" else options)
+        assert canonical.model_dump() == before
+        assert prepared._candidate is None
+    finally:
+        await owner.cleanup()
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("support", [False, True])
 async def test_actual_cli_late_factory_uses_f1_private_projection_and_checkpoint(tmp_path, enabled, support):
