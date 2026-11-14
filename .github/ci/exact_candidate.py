@@ -107,10 +107,13 @@ def validate(expected, collected, reports, collection_errors, exitstatus, skip_a
         skip_rows = [r for r in rows if r["outcome"] == "skipped"]
         if skip_rows:
             allowed_reason = skip_allowed.get(node)
-            expected_phases = ["setup", "teardown"] if skip_rows[0]["when"] == "setup" else ["setup", "call", "teardown"]
-            if (not allowed_reason or len(skip_rows) != 1 or phases != expected_phases
-                    or allowed_reason not in skip_rows[0]["reason"]
-                    or any(r["outcome"] == "failed" for r in rows)):
+            # Both existing optional contracts skip in unittest's call phase.
+            # A matching node/reason never excuses skipped setup or teardown.
+            if (not allowed_reason or len(skip_rows) != 1
+                    or skip_rows[0]["when"] != "call"
+                    or phases != ["setup", "call", "teardown"]
+                    or [r["outcome"] for r in rows] != ["passed", "skipped", "passed"]
+                    or allowed_reason not in skip_rows[0]["reason"]):
                 errors.append(f"unqualified skip: {node}")
             skipped.append(node)
         elif phases != ["setup", "call", "teardown"] or any(r["outcome"] != "passed" for r in rows):
