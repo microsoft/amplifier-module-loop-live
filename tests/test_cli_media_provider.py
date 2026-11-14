@@ -48,11 +48,12 @@ class Provider:
 
 def coordinator(providers, factory=None, runtime=None):
     caps = {"cli.media.prepare_provider": factory, "live.runtime": runtime}
+    tools = {}
     return SimpleNamespace(
         session_id="fixture", config={}, get_capability=caps.get,
         register_capability=lambda k, v: caps.__setitem__(k, v),
-        get=lambda kind: providers if kind == "providers" else {},
-        mount=AsyncMock(),
+        get=lambda kind: providers if kind == "providers" else tools if kind == "tools" else {},
+        mount=AsyncMock(side_effect=lambda kind, module, *, name: tools.__setitem__(name, module)),
     )
 
 
@@ -400,6 +401,8 @@ async def test_cli_execution_registration_ends_after_late_setup_before_engine(mo
         mounted[name] = module
         order.append("mount:" + name)
     selected.mount = mount
+    selected_get = selected.get
+    selected.get = lambda kind: mounted if kind == "tools" else selected_get(kind)
     @contextmanager
     def registration():
         order.append("enter")

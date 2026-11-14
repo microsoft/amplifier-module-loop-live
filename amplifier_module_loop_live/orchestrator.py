@@ -256,13 +256,22 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                     await adapter_mount("tools", wrapped, previous=tools[name], name=name)
                 else:
                     await coordinator.mount("tools", wrapped, name=name)
-                tools[name] = wrapped
+                # A host's public mount may install a guarded/decorated object.
+                # Never overwrite that canonical slot with our pre-mount input.
+                tools[name] = self._installed_tool(coordinator, name)
         job_control = JobControl(self)
         if "live_job" in tools and callable(adapter_mount):
             await adapter_mount("tools", job_control, previous=tools["live_job"], name="live_job")
         else:
             await coordinator.mount("tools", job_control, name="live_job")
-        tools["live_job"] = job_control
+        tools["live_job"] = self._installed_tool(coordinator, "live_job")
+
+    @staticmethod
+    def _installed_tool(coordinator, name):
+        installed = coordinator.get("tools")
+        if not isinstance(installed, dict) or name not in installed:
+            raise RuntimeError("Live tool mount was not acknowledged in the canonical inventory")
+        return installed[name]
 
     async def _execute_live(self, prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope,
                             registration_ready=None):

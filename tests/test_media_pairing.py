@@ -228,9 +228,11 @@ async def test_async_structured_attachment_live_path_checkpoints_before_engine_r
         return {"saved": True}
     capabilities = {"live.runtime": runtime, "live.attachments.encode": encode,
                     "session.durable_checkpoint": checkpoint}
+    mounted = {}
     coordinator = SimpleNamespace(get_capability=capabilities.get, config={},
                                   register_capability=lambda k, v: capabilities.__setitem__(k, v),
-                                  mount=AsyncMock())
+                                  get=lambda kind: mounted,
+                                  mount=AsyncMock(side_effect=lambda kind, value, *, name: mounted.__setitem__(name, value)))
     command = Input("user", "prompt", id="upload", attachments=("public-uuid",))
     loop = BundleLiveOrchestrator({})
     loop.coordinator, loop.runtime, loop.host = coordinator, runtime, HostAdapter()
@@ -365,8 +367,10 @@ async def test_initial_async_attachment_does_not_enter_engine_after_admission_lo
     monkeypatch.setattr(StreamingOrchestrator, "execute", engine)
     capabilities = {"live.runtime": runtime, "live.activation": ownership,
                     "live.attachments.encode": encode}
+    mounted = {}
     coordinator = SimpleNamespace(get_capability=capabilities.get, config={},
-        register_capability=lambda key, value: capabilities.__setitem__(key, value), mount=AsyncMock())
+        register_capability=lambda key, value: capabilities.__setitem__(key, value), get=lambda kind: mounted,
+        mount=AsyncMock(side_effect=lambda kind, value, *, name: mounted.__setitem__(name, value)))
     hooks = SimpleNamespace(register=lambda *a, **kw: lambda: None, emit=AsyncMock())
     loop = BundleLiveOrchestrator({})
     command = Input("user", "prompt", id="initial-race", attachments=("upload",),
@@ -497,7 +501,8 @@ async def test_initial_attachment_delivery_requires_append_checkpoint_ack(checkp
 
 @pytest.mark.parametrize("mount_name", ["delegate", "live_job"])
 @pytest.mark.parametrize("failure", ["cancel", "lost-ack"])
-async def test_live_mount_interruption_closes_owner_without_rolling_back_effect(mount_name, failure):
+@pytest.mark.parametrize("decorated", [False, True])
+async def test_live_mount_interruption_closes_owner_without_rolling_back_effect(mount_name, failure, decorated):
     from amplifier_core import AmplifierSession
     from amplifier_module_loop_live.jobs import AsyncTool, JobControl
     from test_loop import NativeProvider, Delegate
@@ -513,11 +518,16 @@ async def test_live_mount_interruption_closes_owner_without_rolling_back_effect(
     owner.register_capability("live.runtime", runtime)
     entered = asyncio.Event()
     attempted = []
+    class Guarded:
+        def __init__(self, original):
+            self.original = original
+        def __getattr__(self, name):
+            return getattr(self.original, name)
     class MountView:
         def __getattr__(self, name):
             return getattr(owner, name)
         async def mount(self, kind, module, *, name):
-            await owner.mount(kind, module, name=name)
+            await owner.mount(kind, Guarded(module) if decorated else module, name=name)
             attempted.append(name)
             if name == mount_name:
                 entered.set()
@@ -540,7 +550,11 @@ async def test_live_mount_interruption_closes_owner_without_rolling_back_effect(
         assert not loop.running and loop.runtime is None and runtime.closed
         assert runtime.steering_wake is None and runtime.anchored_steering_mode is None
         driver.close_live.assert_awaited_once()
-        assert isinstance(owner.get("tools", mount_name), AsyncTool if mount_name == "delegate" else JobControl)
+        installed = owner.get("tools", mount_name)
+        if decorated:
+            assert isinstance(installed, Guarded)
+            installed = installed.original
+        assert isinstance(installed, AsyncTool if mount_name == "delegate" else JobControl)
         assert attempted == (["delegate"] if mount_name == "delegate" else ["delegate", "live_job"])
         assert not driver.requests.qsize()
         assert not any(event["type"] == "session.ready" for event in runtime.events)
@@ -550,3 +564,64 @@ async def test_live_mount_interruption_closes_owner_without_rolling_back_effect(
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await session.cleanup()
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("adapted", [False, True])
+async def test_live_tool_mount_keeps_actual_decorated_inventory(shared, adapted):
+    from amplifier_core import AmplifierSession
+    from amplifier_module_loop_live.jobs import AsyncTool, JobControl
+    from test_loop import Delegate
+    session = AmplifierSession({"session": {"orchestrator": {"module": "loop-live"},
+                                           "context": {"module": "context-simple"}}, "providers": []})
+    await session.initialize()
+    owner = session.coordinator
+    original = Delegate()
+    await owner.mount("tools", original, name="delegate")
+    edges, installed = [], {}
+    class Guarded:
+        def __init__(self, original):
+            self.original = original
+        def __getattr__(self, name):
+            return getattr(self.original, name)
+    class DecoratingView:
+        def get(self, kind):
+            return owner.get(kind)
+        async def mount(self, kind, module, *, name):
+            guarded = Guarded(module)
+            installed[name] = guarded
+            await owner.mount(kind, guarded, name=name)
+    view = DecoratingView()
+    if adapted:
+        async def mount_adapter(kind, module, *, previous, name):
+            assert owner.get(kind, name) is previous
+            edges.append((name, previous, module))
+            await view.mount(kind, module, name=name)
+        view.mount_adapter = mount_adapter
+    tools = owner.get("tools") if shared else dict(owner.get("tools"))
+    loop = owner.get("orchestrator")
+    try:
+        await loop._mount_live_tools(tools, view)
+        assert tools["delegate"] is owner.get("tools", "delegate") is installed["delegate"]
+        assert tools["live_job"] is owner.get("tools", "live_job") is installed["live_job"]
+        assert isinstance(tools["delegate"].original, AsyncTool)
+        assert tools["delegate"].original.original is original
+        assert isinstance(tools["live_job"].original, JobControl)
+        assert len(edges) == int(adapted)
+        if adapted:
+            assert edges[0][0] == "delegate" and edges[0][1] is original
+        # No provider/tool work is used to establish inventory identity.
+        assert original.calls == 0
+    finally:
+        await session.cleanup()
+
+
+async def test_live_tool_mount_without_canonical_ack_refuses_without_raw_reattachment():
+    from amplifier_module_loop_live.orchestrator import BundleLiveOrchestrator
+    loop, tools = BundleLiveOrchestrator({}), {}
+    mount = AsyncMock()
+    coordinator = SimpleNamespace(mount=mount, get=lambda kind: {})
+    with pytest.raises(RuntimeError, match="canonical inventory"):
+        await loop._mount_live_tools(tools, coordinator)
+    mount.assert_awaited_once()
+    assert tools == {}

@@ -412,8 +412,11 @@ class LiveCarrierTests(unittest.IsolatedAsyncioTestCase):
         native = SimpleNamespace(native_bundle_live=True, steer_live=AsyncMock(return_value=True),
                                  close_live=AsyncMock())
         capabilities = {"live.runtime": runtime}
+        mounted = {}
         coordinator = SimpleNamespace(get_capability=capabilities.get,
-                                      register_capability=lambda k, v: capabilities.__setitem__(k, v), config={}, mount=AsyncMock())
+                                      register_capability=lambda k, v: capabilities.__setitem__(k, v), config={},
+                                      get=lambda kind: mounted,
+                                      mount=AsyncMock(side_effect=lambda kind, value, *, name: mounted.__setitem__(name, value)))
         hooks = SimpleNamespace(register=lambda *a, **kw: lambda: None, emit=AsyncMock())
         loop = BundleLiveOrchestrator({})
         loop.root_provider = native

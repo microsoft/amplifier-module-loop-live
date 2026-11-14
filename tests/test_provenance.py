@@ -35,7 +35,9 @@ async def test_new_turn_uses_tagged_context_before_engine_writes(monkeypatch):
         saved.set();return 'done'
     monkeypatch.setattr(StreamingOrchestrator,'execute',finite)
     capabilities={'live.runtime':runtime}
-    coordinator=SimpleNamespace(get_capability=capabilities.get,register_capability=lambda name,value:capabilities.__setitem__(name,value),config={},mount=AsyncMock())
+    mounted={}
+    coordinator=SimpleNamespace(get_capability=capabilities.get,register_capability=lambda name,value:capabilities.__setitem__(name,value),
+        config={},get=lambda kind:mounted,mount=AsyncMock(side_effect=lambda kind,value,*,name:mounted.__setitem__(name,value)))
     hooks=SimpleNamespace(register=lambda *a,**kw:lambda:None,emit=AsyncMock())
     loop=BundleLiveOrchestrator({});loop.root_provider=SimpleNamespace()
     await runtime.submit(command)
