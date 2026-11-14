@@ -120,11 +120,15 @@ class ObservedWorkerProvider:
         self._request_candidate = (request, copy.deepcopy(snapshot), view)
         return view
 
-    def _request_budget(self, request, **kwargs):
-        return self.original.request_budget(self._request_view(request), **kwargs)
+    def _request_budget(self, request, *, request_options=None, **kwargs):
+        from amplifier_loop_live_cli.selection import optional_request_call
+        return optional_request_call(self.original.request_budget, self._request_view(request),
+                                     request_options=request_options, **kwargs)
 
-    def _refit_request(self, request, **kwargs):
-        return self.original.refit_request(self._request_view(request), **kwargs)
+    def _refit_request(self, request, *, request_options=None, **kwargs):
+        from amplifier_loop_live_cli.selection import optional_request_call
+        return optional_request_call(self.original.refit_request, self._request_view(request),
+                                     request_options=request_options, **kwargs)
 
     def _compact_context(self, request, **kwargs):
         return self.original.compact_context(self._request_view(request), **kwargs)

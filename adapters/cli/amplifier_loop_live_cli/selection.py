@@ -1,11 +1,27 @@
 """Explicit root selection; mounted providers and worker routing stay intact."""
 import asyncio
 import copy
+import inspect
 from amplifier_loop_live_cli.catalog import MODELS, copilot_models, select_model, validate_controls, SelectionError
 
 FAMILIES = {"provider-openai": "openai", "provider-anthropic": "anthropic",
             "provider-openai-chatgpt": "chatgpt", "provider-github-copilot": "copilot",
             "provider-gemini": "gemini"}
+
+
+def optional_request_call(method, request, *, request_options=None, **kwargs):
+    """Preserve strict optional signatures without retrying implementation errors."""
+    parameters = inspect.signature(method).parameters
+    if "request_options" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        kwargs["request_options"] = request_options
+    elif request_options:
+        # These two selected values are already explicit on the canonical view.
+        remaining = {key: value for key, value in request_options.items()
+                     if key not in {"model", "reasoning_effort"} or getattr(request, key, None) != value}
+        if remaining:
+            return None  # Counting these options is genuinely unavailable.
+    return method(request, **kwargs)
 
 
 async def choices_for(providers, plan, *, discover=True):
@@ -43,7 +59,8 @@ class RootProvider:
     def _install_request_methods(self):
         # Optional methods must remain genuinely optional, and must apply the
         # same selected model/options before private projection as complete().
-        for name in ("request_budget", "refit_request", "stream", "compact_context", "media_budget_witness"):
+        for name in ("request_budget", "refit_request", "stream", "compact_context", "media_budget_witness",
+                     "get_stream_request_support"):
             if callable(getattr(self.provider, name, None)):
                 setattr(self, name, getattr(self, "_" + name))
 
@@ -73,13 +90,13 @@ class RootProvider:
         self._request_candidate = (request, copy.deepcopy(snapshot), copy.deepcopy(updates), view)
         return view, kwargs
 
-    def _request_budget(self, request, **kwargs):
-        request, kwargs = self._request_view(request, kwargs)
-        return self.provider.request_budget(request, **kwargs)
+    def _request_budget(self, request, *, request_options=None, **kwargs):
+        request, options = self._request_view(request, request_options or {})
+        return optional_request_call(self.provider.request_budget, request, request_options=options, **kwargs)
 
-    def _refit_request(self, request, **kwargs):
-        request, kwargs = self._request_view(request, kwargs)
-        return self.provider.refit_request(request, **kwargs)
+    def _refit_request(self, request, *, request_options=None, **kwargs):
+        request, options = self._request_view(request, request_options or {})
+        return optional_request_call(self.provider.refit_request, request, request_options=options, **kwargs)
 
     def _stream(self, request, **kwargs):
         request, kwargs = self._request_view(request, kwargs)
@@ -92,6 +109,19 @@ class RootProvider:
     def _media_budget_witness(self, request, *, request_options=None):
         request, options = self._request_view(request, request_options or {})
         return self.provider.media_budget_witness(request, request_options=options)
+
+    def _get_stream_request_support(self, *, model, request_options=None):
+        options = dict(request_options or {})
+        options["model"] = self.selection["model"]
+        effort, budget = self.selection["effort"], self.selection.get("thinkingBudget")
+        if effort is not None:
+            options["reasoning_effort"] = effort
+        if budget is not None:
+            options.update(extended_thinking=budget > 0, thinking_budget_tokens=budget)
+        if self.family in {"openai", "chatgpt"} and effort == "none" and budget is None:
+            options["reasoning"] = {"effort": "none"}
+        return self.provider.get_stream_request_support(
+            model=self.selection["model"], request_options=options)
 
     def __getattr__(self, name):
         return getattr(self.provider, name)

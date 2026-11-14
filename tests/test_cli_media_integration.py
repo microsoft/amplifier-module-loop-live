@@ -26,6 +26,8 @@ from amplifier_loop_live_cli.host_adapter import CLIHostAdapter
 from amplifier_module_loop_live.job_store import JobStore
 from amplifier_module_loop_live.runtime import Runtime
 from test_cli_media_provider import Provider, no_network  # noqa: F401
+from amplifier_loop_live_cli.selection import RootProvider
+from amplifier_loop_live_cli.worker_settings import ObservedWorkerProvider
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Candidate durable media store is POSIX-only")
 POLICY = {"enabled": True, "max_bytes": 1024 * 1024, "max_pixels": 10000, "max_images": 10}
@@ -35,6 +37,61 @@ def pixels():
     stream = io.BytesIO()
     Image.new("RGB", (3, 2), "orange").save(stream, format="PNG")
     return stream.getvalue()
+
+
+@pytest.mark.parametrize("wrapper", ["mounted", "root", "worker"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_actual_engine_counts_and_dispatches_through_cli_neutral_factory(tmp_path, wrapper, streaming):
+    """Exercise the actual engine call shape, including stream's tools option."""
+    from amplifier_core import ProviderInfo
+    from amplifier_core.message_models import ChatResponse, TextBlock
+    session = AmplifierSession({"session": {"orchestrator": {"module": "loop-live",
+                                "config": {"min_delay_between_calls_ms": 0}},
+                                "context": {"module": "context-simple"}}, "providers": []})
+    native = SessionStore(tmp_path / "sessions")
+    host = install_session_media(session, native)
+    await session.initialize()
+    owner = session.coordinator
+    observed, records = [], []
+    class Selected(Provider):
+        def get_info(self):
+            return ProviderInfo(id="fixture", display_name="Offline fixture",
+                                capabilities=["tools"], defaults={"model": "default"})
+        async def request_budget(self, request, *, context_estimate, request_options=None):
+            host.capability.validate(request, purpose="count", request_options=request_options)
+            observed.append(("count", id(request)))
+            return None  # Ordering/identity only, never a measured fit claim.
+        async def complete(self, request, **kwargs):
+            host.capability.validate(request, purpose="transport", request_options=kwargs)
+            observed.append(("send", id(request)))
+            return ChatResponse(content=[TextBlock(text="done")])
+    driver = Selected()
+    if streaming:
+        async def stream(request, **kwargs):
+            host.capability.validate(request, purpose="transport", request_options=kwargs)
+            observed.append(("send", id(request)))
+            yield {"content": "done"}
+        driver.stream = stream
+    await owner.mount("providers", driver, name="account")
+    loop = owner.get("orchestrator")
+    if wrapper == "root":
+        loop.root_provider = RootProvider(driver, {"instance": "account", "model": "default",
+                                                  "effort": None, "thinkingBudget": None}, "fixture")
+    elif wrapper == "worker":
+        registry = SimpleNamespace(configuration=lambda *args: records.append(args))
+        loop.root_provider = ObservedWorkerProvider(driver, {"account": driver}, registry, "child")
+    owner.register_capability("live.host", CLIHostAdapter())
+    try:
+        result = await loop.execute("ordinary text", owner.get("context"), owner.get("providers"),
+                                    owner.get("tools"), owner.hooks, owner)
+        assert result == "done"
+        assert observed[-1][0] == "send" and any(kind == "count" for kind, _ in observed)
+        assert observed[-2] == ("count", observed[-1][1])
+        if wrapper == "worker":
+            assert records[-1][1]["instance"] == "account"
+        assert not (native.base_dir / session.session_id).exists()
+    finally:
+        await session.cleanup()
 
 
 class Owner:

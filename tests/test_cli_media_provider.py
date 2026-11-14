@@ -1,6 +1,7 @@
 """Late CLI provider selection/projection boundaries; offline, no host activation."""
 import asyncio
 import copy
+import inspect
 from pathlib import Path
 import socket
 import sys
@@ -161,8 +162,8 @@ async def test_selected_root_preserves_canonical_diagnostics_and_exact_private_c
     class Selected(Provider):
         def get_media_request_support(self, **kwargs):
             return {"v": 1, "positions": []}
-        async def request_budget(self, request, *, context_estimate=0, **kwargs):
-            observed.append(("count", request, copy.deepcopy(kwargs)))
+        async def request_budget(self, request, *, context_estimate=0, request_options=None):
+            observed.append(("count", request, {"request_options": copy.deepcopy(request_options)}))
             return {"estimated_input_tokens": 10, "input_limit_tokens": 100, "context_token_budget": 100,
                     "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 10}}
         async def complete(self, request, **kwargs):
@@ -200,9 +201,63 @@ async def test_selected_root_preserves_canonical_diagnostics_and_exact_private_c
     count, send = observed
     assert count[1] is send[1]
     assert count[1].model == "selected-model" and count[1].reasoning_effort == chosen["effort"]
-    assert count[2] == {**send[2], "request_options": None}
+    assert count[2] == {"request_options": send[2]}
     assert request.model_dump() == before
     assert all("PRIVATE PROJECTION SENTINEL" not in str(data) for _, data in traces)
+
+
+@pytest.mark.parametrize("kind", ["root", "worker"])
+async def test_optional_budget_and_refit_keep_named_options_and_strict_provider_signatures(kind):
+    observed = []
+    class Strict(Provider):
+        async def request_budget(self, request, *, context_estimate, request_options=None):
+            observed.append((request, request_options, context_estimate))
+            return "counted"
+        async def refit_request(self, request, *, error, context_estimate, request_options=None):
+            observed.append((request, request_options, context_estimate))
+            return "refitted"
+    driver = Strict()
+    registry = SimpleNamespace(configuration=lambda *a: None)
+    view = (RootProvider(driver, selection(), "fixture") if kind == "root" else
+            ObservedWorkerProvider(driver, {"account": driver}, registry, "child"))
+    request = ChatRequest(messages=[Message(role="user", content="refs")])
+    options = {"extended_thinking": True}
+    assert "request_options" in inspect.signature(view.request_budget).parameters
+    assert "request_options" in inspect.signature(view.refit_request).parameters
+    assert await view.request_budget(request, context_estimate=1, request_options=options) == "counted"
+    assert await view.refit_request(request, error=ValueError(), context_estimate=1, request_options=options) == "refitted"
+    assert observed[0][0] is observed[1][0]
+    expected = ({**options, "model": "selected-model", "reasoning_effort": "high"} if kind == "root" else options)
+    assert observed[0][1] == observed[1][1] == expected
+
+
+async def test_strict_legacy_counter_does_not_receive_transport_kwargs_or_retry():
+    calls = []
+    class Legacy(Provider):
+        def request_budget(self, request, *, context_estimate):
+            calls.append(request)
+            return "legacy"
+    view = RootProvider(Legacy(), selection(), "fixture")
+    request = ChatRequest(messages=[])
+    assert view.request_budget(request, context_estimate=1) == "legacy"
+    assert calls[0].model == "selected-model"
+    assert view.request_budget(request, context_estimate=1, request_options={"temperature": 0.5}) is None
+    assert len(calls) == 1
+
+
+def test_stream_request_support_is_forwarded_only_from_actual_provider_with_selected_options():
+    driver, observed = Provider(), []
+    raw = RootProvider(driver, selection(), "fixture")
+    assert not hasattr(raw, "get_stream_request_support")
+    def support(*, model, request_options=None):
+        observed.append((model, request_options))
+        return {"v": 1, "tools": "chat_request"}
+    driver.get_stream_request_support = support
+    view = RootProvider(driver, selection(), "fixture")
+    assert view.get_stream_request_support(model="ignored", request_options={"temperature": 0.3}) == {
+        "v": 1, "tools": "chat_request"}
+    assert observed == [("selected-model", {"temperature": 0.3, "model": "selected-model",
+                                            "reasoning_effort": "high"})]
 
 
 async def test_all_mounted_aliases_are_prepared_before_later_pin_or_utility_selection(monkeypatch):
@@ -220,6 +275,7 @@ async def test_all_mounted_aliases_are_prepared_before_later_pin_or_utility_sele
         assert providers == views
         self._pinned_provider_name = "second"
         assert self._select_provider(providers) is views["second"]
+        assert self._select_provider(owner.get("providers")) is views["second"]
         return "done"
     monkeypatch.setattr(StreamingOrchestrator, "execute", execute)
     await BundleLiveOrchestrator({}).execute("text", Context(), drivers, {}, None, owner)

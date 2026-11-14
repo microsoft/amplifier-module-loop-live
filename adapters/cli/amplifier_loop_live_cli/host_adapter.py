@@ -90,7 +90,7 @@ class CLIHostAdapter(HostAdapter):
         prepared.__wrapped__ = provider
         # Foundation intentionally has no catch-all __getattr__. These are live
         # controls, not request-consuming optional provider capabilities.
-        for name in ("native_bundle_live", "steer_live", "close_live"):
+        for name in ("native_bundle_live", "steer_live", "close_live", "priority"):
             if hasattr(provider, name):
                 setattr(prepared, name, getattr(provider, name))
         return prepared
