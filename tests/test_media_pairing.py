@@ -346,3 +346,78 @@ async def test_async_attachment_checkpoint_lost_ack_is_unknown_not_redelivered()
     assert runtime.events[0]["input_id"] == command.id
     await loop._drain_steering(context, SimpleNamespace(emit=AsyncMock()), 2)
     assert len(context.messages) == 1
+
+
+@pytest.mark.parametrize("race", ["stop", "revoke"])
+async def test_initial_async_attachment_does_not_enter_engine_after_admission_loss(monkeypatch, race):
+    from amplifier_module_loop_live.orchestrator import BundleLiveOrchestrator, StreamingOrchestrator
+    from test_activation import Ownership
+    ownership, runtime, context = Ownership(), Runtime(), Context()
+    activation = ownership.activate()
+    runtime.capture_activation = ownership.current
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def encode(*args):
+        entered.set()
+        await release.wait()
+        return {"content": "not admitted", "metadata": {MEDIA: carrier()["metadata"][MEDIA]}}
+    engine = AsyncMock(return_value="must not run")
+    monkeypatch.setattr(StreamingOrchestrator, "execute", engine)
+    capabilities = {"live.runtime": runtime, "live.activation": ownership,
+                    "live.attachments.encode": encode}
+    coordinator = SimpleNamespace(get_capability=capabilities.get, config={},
+        register_capability=lambda key, value: capabilities.__setitem__(key, value))
+    hooks = SimpleNamespace(register=lambda *a, **kw: lambda: None, emit=AsyncMock())
+    loop = BundleLiveOrchestrator({})
+    command = Input("user", "prompt", id="initial-race", attachments=("upload",),
+                    activation=activation)
+    task = asyncio.create_task(loop.execute("", context, {"fixture": SimpleNamespace()},
+                                           {}, hooks, coordinator))
+    try:
+        await runtime.submit(command)
+        await asyncio.wait_for(entered.wait(), 2)
+        if race == "stop":
+            await runtime.submit(Input("stop"))
+        else:
+            ownership.release(activation)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)
+        engine.assert_not_awaited()
+        assert context.messages == []
+        assert not any(e["type"] == "input.delivered" and e.get("input_id") == command.id
+                       for e in runtime.events)
+        held = [e for e in runtime.events if e["type"] == "input.held" and e["input_id"] == command.id]
+        assert len(held) == 1 and held[0]["reason"] == "attachment-preparation-not-admitted"
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_cancel_during_attachment_checkpoint_preserves_append_and_unknown_disposition():
+    from amplifier_module_loop_live.orchestrator import BundleLiveOrchestrator
+    runtime, context = Runtime(), Context()
+    entered, release = asyncio.Event(), asyncio.Event()
+    encoded = {"content": "canonical attachment", "metadata": {MEDIA: carrier()["metadata"][MEDIA]}}
+    async def encode(*args):
+        return copy.deepcopy(encoded)
+    async def checkpoint():
+        entered.set()
+        await release.wait()
+        return {"saved": True}
+    capabilities = {"live.attachments.encode": encode, "session.durable_checkpoint": checkpoint}
+    coordinator = SimpleNamespace(get_capability=capabilities.get)
+    loop = BundleLiveOrchestrator({})
+    loop.host, loop.coordinator, loop.runtime = HostAdapter(), coordinator, runtime
+    command = Input("user", "prompt", id="cancel-checkpoint", attachments=("upload",))
+    loop.pending.append(command)
+    task = asyncio.create_task(loop._drain_steering(context, SimpleNamespace(emit=AsyncMock()), 1))
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not loop.pending and len(context.messages) == 1
+    assert context.messages[0]["metadata"][MEDIA] == encoded["metadata"][MEDIA]
+    assert [event["type"] for event in runtime.events] == ["input.unknown"]
+    assert loop._boundary_pending  # No request may dispatch from this failed drain.
+    await loop._drain_steering(context, SimpleNamespace(emit=AsyncMock()), 2)
+    assert len(context.messages) == 1
