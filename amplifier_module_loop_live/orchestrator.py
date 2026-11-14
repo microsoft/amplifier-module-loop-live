@@ -11,6 +11,7 @@ import copy
 import json
 import uuid
 from collections import deque
+from contextlib import ExitStack
 from contextvars import ContextVar
 
 from amplifier_core import HookResult
@@ -231,9 +232,13 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         token = HOST_ADAPTER.set(self.host)
         provider_token = _PROVIDER_VIEWS.set(None)
         try:
-            runtime, providers, finite_scope = await self.host.prepare_execution(self, coordinator, providers)
-            with self.approved_dispatch.run_scope(coordinator):
-                return await self._execute_live(prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope)
+            with ExitStack() as registration:
+                coordinator, hooks = registration.enter_context(
+                    self.host.execution_registration(coordinator, hooks))
+                runtime, providers, finite_scope = await self.host.prepare_execution(self, coordinator, providers)
+                with self.approved_dispatch.run_scope(coordinator):
+                    return await self._execute_live(prompt, context, providers, tools, hooks, coordinator,
+                                                    runtime, finite_scope, registration.close)
         finally:
             _PROVIDER_VIEWS.reset(provider_token)
             HOST_ADAPTER.reset(token)
@@ -259,7 +264,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             await coordinator.mount("tools", job_control, name="live_job")
         tools["live_job"] = job_control
 
-    async def _execute_live(self, prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope):
+    async def _execute_live(self, prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope,
+                            registration_ready=None):
         # A host may replace rather than mutate its providers. Prepare all
         # aliases after native installation: later pins and utility selections
         # must not bypass even the neutral/no-vision request adapter.
@@ -290,6 +296,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         if runtime is None:
             # CLI's production spawner expects a finite result from workers.
             try:
+                if registration_ready:
+                    registration_ready()
                 result=await self._execute_guarded_goal(prompt, context, providers, tools, hooks, coordinator)
                 self.host.finite_finished(finite_scope, coordinator, "completed", result)
                 return result
@@ -414,6 +422,8 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             # await. A lost mount acknowledgment is not rollback or permission
             # to repeat execution, but must not leak this live owner.
             await self._mount_live_tools(tools, coordinator)
+            if registration_ready:
+                registration_ready()
             await runtime.emit("session.ready", mode="configured_bundle", native=bool(native),
                 steering="native" if native else "request_boundary", async_tools="native" if native else "delegate_job_handles" if
                 self.config.get("background_delegate") else "none",

@@ -3,6 +3,7 @@
 import copy
 import inspect
 from collections.abc import Mapping
+from contextlib import nullcontext
 
 
 async def attachment_content(host, command, coordinator):
@@ -38,6 +39,10 @@ async def checkpoint_attachment(message, coordinator):
 
 
 class HostAdapter:
+    def execution_registration(self, coordinator, hooks):
+        """Own registration only; never span provider/tool execution."""
+        return nullcontext((coordinator, hooks))
+
     async def prepare_execution(self, loop, coordinator, providers):
         runtime = coordinator.get_capability("live.runtime") if coordinator else None
         return runtime, providers, None

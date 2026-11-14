@@ -271,6 +271,127 @@ def test_fallback_witness_stays_absent_without_actual_provider_method(wrapper):
     assert not hasattr(view, "media_text_fallback_witness")
 
 
+@pytest.mark.parametrize("wrapper", ["root", "worker"])
+@pytest.mark.parametrize("implementation", ["missing", None, False])
+def test_release_stays_absent_without_actual_callable(wrapper, implementation):
+    driver = Provider()
+    if implementation != "missing":
+        driver.release_media_request = implementation
+    view = (RootProvider(driver, selection(), "fixture") if wrapper == "root" else
+            ObservedWorkerProvider(driver, {"account": driver},
+                                   SimpleNamespace(configuration=lambda *a: None), "child"))
+    assert not hasattr(view, "release_media_request")
+
+
+@pytest.mark.parametrize("wrapper", ["root", "worker"])
+async def test_release_forwards_exact_cached_count_candidate_and_effective_options(wrapper):
+    from amplifier_core.message_models import ToolSpec
+    records = []
+    class Selected(Provider):
+        async def request_budget(self, request, *, context_estimate=None, request_options=None):
+            records.append(("count", request, copy.deepcopy(request_options)))
+        def release_media_request(self, request, *, request_options=None):
+            records.append(("release", request, copy.deepcopy(request_options)))
+            return records[-1][1:] == records[0][1:]
+    driver = Selected()
+    view = (RootProvider(driver, selection(), "fixture") if wrapper == "root" else
+            ObservedWorkerProvider(driver, {"account": driver},
+                                   SimpleNamespace(configuration=lambda *a: None), "child"))
+    request = ChatRequest(messages=[Message(role="user", content="canonical refs")], tools=[
+        ToolSpec(name="computer", parameters={}, description="fixture").model_copy(update={"type": "computer"})])
+    before = copy.deepcopy(request.model_dump())
+    options = {"temperature": 0.25, "extra": {"a": [1]}}
+    await view.request_budget(request, request_options=options)
+    assert view.release_media_request(request, request_options=copy.deepcopy(options)) is True
+    assert view.release_media_request(request, request_options=copy.deepcopy(options)) is True
+    assert all(record[1] is records[0][1] for record in records)
+    assert all(record[2] == records[0][2] for record in records)
+    assert records[0][1] is not request
+    assert request.model_dump() == before
+    def fail(request, *, request_options=None):
+        raise TypeError("release implementation error")
+    driver.release_media_request = fail
+    with pytest.raises(TypeError, match="implementation error"):
+        view.release_media_request(request, request_options=options)
+
+
+@pytest.mark.parametrize("live", [False, True])
+async def test_cli_execution_registration_ends_after_late_setup_before_engine(monkeypatch, live):
+    from contextlib import contextmanager
+    from amplifier_loop_live_cli import computer_results, diagnostics
+    order, mounted = [], {}
+    driver = Provider()
+    runtime = Runtime() if live else None
+    base = coordinator({"account": driver}, runtime=runtime)
+    selected = coordinator({"account": driver}, runtime=runtime)
+    hooks = SimpleNamespace(register=lambda *a, **kw: order.append("register") or (lambda: None), emit=AsyncMock())
+    selected.hooks = hooks
+    async def mount(kind, module, *, name):
+        mounted[name] = module
+        order.append("mount:" + name)
+    selected.mount = mount
+    @contextmanager
+    def registration():
+        order.append("enter")
+        yield selected
+        order.append("sealed")
+    base.register_capability("cli.media.execution_registration", registration)
+    base.register_capability("live.host", CLIHostAdapter())
+    monkeypatch.setattr(diagnostics, "install_hooks", lambda owner: order.append("diagnostics")
+                        if owner is selected else pytest.fail("wrong registration owner"))
+    monkeypatch.setattr(computer_results, "prepare_computer_provider",
+                        lambda provider, owner: order.append("computer") if owner is selected else pytest.fail("wrong owner"))
+    async def finite(self, prompt, ctx, providers, tools, actual_hooks, actual_owner):
+        assert actual_owner is selected and actual_hooks is hooks
+        assert order[0] == "enter" and order.count("sealed") == 1
+        if live:
+            assert "mount:live_job" in order and order.index("mount:live_job") < order.index("sealed")
+        order.append("engine")
+        return "done"
+    monkeypatch.setattr(StreamingOrchestrator, "execute", finite)
+    loop = BundleLiveOrchestrator({})
+    task = asyncio.create_task(loop.execute("prompt", Context(), {"account": driver}, {}, None, base))
+    try:
+        if live:
+            await runtime.wait_for(lambda event: event["type"] == "generation.finished", 2)
+            await runtime.submit(Input("stop"))
+        assert await asyncio.wait_for(task, 2) in {"done", ""}
+        assert order.index("diagnostics") < order.index("computer") < order.index("sealed") < order.index("engine")
+        assert order.count("enter") == order.count("sealed") == 1
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("failure", ["setup", "seal"])
+async def test_cli_execution_registration_failure_never_enters_engine(monkeypatch, failure):
+    from contextlib import contextmanager
+    from amplifier_loop_live_cli import diagnostics
+    base, selected, order = coordinator({}), coordinator({}), []
+    selected.hooks = SimpleNamespace(register=lambda *a, **k: None, emit=AsyncMock())
+    @contextmanager
+    def registration():
+        try:
+            yield selected
+        except BaseException:
+            order.append("failed")
+            raise
+        order.append("seal")
+        if failure == "seal":
+            raise RuntimeError("registration seal refused")
+    base.register_capability("cli.media.execution_registration", registration)
+    base.register_capability("live.host", CLIHostAdapter())
+    monkeypatch.setattr(diagnostics, "install_hooks",
+        lambda owner: (_ for _ in ()).throw(RuntimeError("setup refused")) if failure == "setup" else None)
+    engine = AsyncMock()
+    monkeypatch.setattr(StreamingOrchestrator, "execute", engine)
+    with pytest.raises(RuntimeError, match="refused"):
+        await BundleLiveOrchestrator({}).execute("", Context(), {}, {}, None, base)
+    engine.assert_not_awaited()
+    assert order == (["failed"] if failure == "setup" else ["seal"])
+
+
 async def test_all_mounted_aliases_are_prepared_before_later_pin_or_utility_selection(monkeypatch):
     drivers = {"first": Provider(), "second": Provider()}
     views = {name: Provider() for name in drivers}

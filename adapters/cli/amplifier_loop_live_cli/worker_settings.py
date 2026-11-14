@@ -93,11 +93,13 @@ class ObservedWorkerProvider:
         self.alias = None
         self._request_candidate = None
         for name in ("request_budget", "refit_request", "stream", "compact_context", "media_budget_witness",
-                     "media_text_fallback_witness"):
+                     "media_text_fallback_witness", "release_media_request"):
             if callable(getattr(original, name, None)):
                 setattr(self, name, getattr(self, "_" + name))
 
     def __getattr__(self, name):
+        if name == "release_media_request":
+            raise AttributeError(name)
         return getattr(self.original, name)
 
     def _selection(self, request, kwargs):
@@ -140,6 +142,10 @@ class ObservedWorkerProvider:
     def _media_text_fallback_witness(self, request, *, request_options=None):
         return self.original.media_text_fallback_witness(self._request_view(request),
                                                         request_options=request_options)
+
+    def _release_media_request(self, request, *, request_options=None):
+        return self.original.release_media_request(self._request_view(request),
+                                                   request_options=request_options)
 
     def _stream(self, request, **kwargs):
         self.registry.configuration(self.identity, self._selection(request, kwargs))

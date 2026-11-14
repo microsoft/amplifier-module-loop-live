@@ -1,9 +1,30 @@
 """Amplifier CLI session setup; the orchestrator owns no CLI imports."""
 
+from contextlib import contextmanager
+
 from amplifier_module_loop_live.host import HostAdapter
 
 
 class CLIHostAdapter(HostAdapter):
+    @contextmanager
+    def execution_registration(self, coordinator, hooks):
+        factory = coordinator.get_capability("cli.media.execution_registration") if coordinator else None
+        if factory is None:
+            yield coordinator, hooks
+            return
+        if not callable(factory):
+            raise TypeError("CLI execution registration must be a context factory")
+        # The CLI owns the actual graph transition and receipt. The adapter
+        # only carries its supplied registration view through real setup.
+        with factory() as selected:
+            selected_hooks = getattr(selected, "hooks", None)
+            if (not callable(getattr(selected, "get_capability", None))
+                    or not callable(getattr(selected, "mount", None))
+                    or not callable(getattr(selected_hooks, "register", None))
+                    or not callable(getattr(selected_hooks, "emit", None))):
+                raise TypeError("CLI execution registration must yield a coordinator view")
+            yield selected, selected_hooks
+
     async def prepare_execution(self, loop, coordinator, providers):
         if coordinator:
             from amplifier_loop_live_cli.diagnostics import install_hooks
