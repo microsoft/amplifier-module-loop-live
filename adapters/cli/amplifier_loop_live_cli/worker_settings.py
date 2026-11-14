@@ -125,16 +125,16 @@ class ObservedWorkerProvider:
         return view
 
     def _request_budget(self, request, *, request_options=None, **kwargs):
-        from amplifier_loop_live_cli.selection import optional_request_call, accepted_preparation
+        from amplifier_loop_live_cli.selection import optional_request_call
         view, accept = self._prepare_request_view(request, request_options)
-        return accepted_preparation(optional_request_call(self.original.request_budget, view,
-                                     request_options=request_options, **kwargs), accept)
+        return optional_request_call(self.original.request_budget, view,
+                                     request_options=request_options, _accepted=accept, **kwargs)
 
     def _refit_request(self, request, *, request_options=None, **kwargs):
-        from amplifier_loop_live_cli.selection import optional_request_call, accepted_preparation
+        from amplifier_loop_live_cli.selection import optional_request_call
         view, accept = self._prepare_request_view(request, request_options)
-        return accepted_preparation(optional_request_call(self.original.refit_request, view,
-                                     request_options=request_options, **kwargs), accept)
+        return optional_request_call(self.original.refit_request, view,
+                                     request_options=request_options, _accepted=accept, **kwargs)
 
     def _prepare_request_view(self, request, request_options):
         view = self._request_view(request)

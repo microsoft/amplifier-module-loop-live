@@ -362,6 +362,29 @@ async def test_release_looks_up_preparation_identity_without_rebuilding_cache(wr
     assert view.release_media_request(canonical, request_options=options) is False
 
 
+@pytest.mark.parametrize("wrapper", ["root", "worker"])
+def test_uninvoked_legacy_counter_does_not_replace_release_binding(wrapper):
+    calls = []
+    class Strict(Provider):
+        def request_budget(self, request, *, context_estimate):
+            calls.append(request)
+            self.candidate = request
+            return None  # An invoked unavailable counter still owns its candidate.
+        def release_media_request(self, request, *, request_options=None):
+            return self.candidate is request
+    driver = Strict()
+    view = (RootProvider(driver, selection(), "fixture") if wrapper == "root" else
+            ObservedWorkerProvider(driver, {"account": driver},
+                                   SimpleNamespace(configuration=lambda *a: None), "child"))
+    a = ChatRequest(messages=[Message(role="user", content="a")])
+    b = ChatRequest(messages=[Message(role="user", content="b")])
+    assert view.request_budget(a, context_estimate=1) is None
+    binding = view._media_release_candidate
+    assert view.request_budget(b, context_estimate=1, request_options={"temperature": 0.3}) is None
+    assert len(calls) == 1 and view._media_release_candidate is binding
+    assert view.release_media_request(a) is True
+
+
 @pytest.mark.parametrize("live", [False, True])
 async def test_cli_execution_registration_ends_after_late_setup_before_engine(monkeypatch, live):
     from contextlib import contextmanager

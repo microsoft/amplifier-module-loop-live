@@ -9,7 +9,7 @@ FAMILIES = {"provider-openai": "openai", "provider-anthropic": "anthropic",
             "provider-gemini": "gemini"}
 
 
-def optional_request_call(method, request, *, request_options=None, **kwargs):
+def optional_request_call(method, request, *, request_options=None, _accepted=None, **kwargs):
     """Preserve strict optional signatures without retrying implementation errors."""
     parameters = inspect.signature(method).parameters
     if "request_options" in parameters or any(
@@ -21,7 +21,8 @@ def optional_request_call(method, request, *, request_options=None, **kwargs):
                      if key not in {"model", "reasoning_effort"} or getattr(request, key, None) != value}
         if remaining:
             return None  # Counting these options is genuinely unavailable.
-    return method(request, **kwargs)
+    result = method(request, **kwargs)
+    return accepted_preparation(result, _accepted) if _accepted is not None else result
 
 
 def accepted_preparation(result, accept):
@@ -108,13 +109,13 @@ class RootProvider:
 
     def _request_budget(self, request, *, request_options=None, **kwargs):
         view, options, accept = self._prepare_request_view(request, request_options)
-        return accepted_preparation(optional_request_call(
-            self.provider.request_budget, view, request_options=options, **kwargs), accept)
+        return optional_request_call(self.provider.request_budget, view,
+                                     request_options=options, _accepted=accept, **kwargs)
 
     def _refit_request(self, request, *, request_options=None, **kwargs):
         view, options, accept = self._prepare_request_view(request, request_options)
-        return accepted_preparation(optional_request_call(
-            self.provider.refit_request, view, request_options=options, **kwargs), accept)
+        return optional_request_call(self.provider.refit_request, view,
+                                     request_options=options, _accepted=accept, **kwargs)
 
     def _prepare_request_view(self, request, request_options):
         caller_options = copy.deepcopy(request_options or {})
