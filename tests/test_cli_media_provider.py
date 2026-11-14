@@ -52,6 +52,7 @@ def coordinator(providers, factory=None, runtime=None):
         session_id="fixture", config={}, get_capability=caps.get,
         register_capability=lambda k, v: caps.__setitem__(k, v),
         get=lambda kind: providers if kind == "providers" else {},
+        mount=AsyncMock(),
     )
 
 

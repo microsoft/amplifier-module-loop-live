@@ -289,8 +289,15 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         eligible = set(self.config.get("background_tools", ["delegate"]))
         for name in eligible.intersection(tools):
             if not isinstance(tools[name], AsyncTool):
-                tools[name] = AsyncTool(tools[name])
-        tools["live_job"] = JobControl(self)
+                wrapped = AsyncTool(tools[name])
+                # The coordinator owns the actual mount inventory. Use its
+                # public boundary so a host construction can attribute these
+                # execution-time replacements before admitting tool work.
+                await coordinator.mount("tools", wrapped, name=name)
+                tools[name] = wrapped
+        job_control = JobControl(self)
+        await coordinator.mount("tools", job_control, name="live_job")
+        tools["live_job"] = job_control
         coordinator.register_capability("context.active_operations", lambda: [
             {"job_id": identity, "call_id": job["call_id"], "status": job.get("status", "pending"),
              "tool": (job.get("tool_call") or {}).get("name")}

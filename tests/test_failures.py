@@ -40,7 +40,7 @@ async def test_local_failure_keeps_cause_and_identity_without_provider_error_or_
     context = SimpleNamespace(get_messages=AsyncMock(return_value=[]))
     capabilities = {'live.runtime': runtime}
     coordinator = SimpleNamespace(get_capability=capabilities.get,
-        register_capability=capabilities.__setitem__, config={})
+        register_capability=capabilities.__setitem__, config={}, mount=AsyncMock())
     hooks = SimpleNamespace(register=lambda *a, **kw: None,
         emit=AsyncMock(return_value=HookResult()))
     provider = SimpleNamespace(name='fixture', config={})

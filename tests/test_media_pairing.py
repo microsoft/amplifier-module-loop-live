@@ -229,7 +229,8 @@ async def test_async_structured_attachment_live_path_checkpoints_before_engine_r
     capabilities = {"live.runtime": runtime, "live.attachments.encode": encode,
                     "session.durable_checkpoint": checkpoint}
     coordinator = SimpleNamespace(get_capability=capabilities.get, config={},
-                                  register_capability=lambda k, v: capabilities.__setitem__(k, v))
+                                  register_capability=lambda k, v: capabilities.__setitem__(k, v),
+                                  mount=AsyncMock())
     command = Input("user", "prompt", id="upload", attachments=("public-uuid",))
     loop = BundleLiveOrchestrator({})
     loop.coordinator, loop.runtime, loop.host = coordinator, runtime, HostAdapter()
@@ -365,7 +366,7 @@ async def test_initial_async_attachment_does_not_enter_engine_after_admission_lo
     capabilities = {"live.runtime": runtime, "live.activation": ownership,
                     "live.attachments.encode": encode}
     coordinator = SimpleNamespace(get_capability=capabilities.get, config={},
-        register_capability=lambda key, value: capabilities.__setitem__(key, value))
+        register_capability=lambda key, value: capabilities.__setitem__(key, value), mount=AsyncMock())
     hooks = SimpleNamespace(register=lambda *a, **kw: lambda: None, emit=AsyncMock())
     loop = BundleLiveOrchestrator({})
     command = Input("user", "prompt", id="initial-race", attachments=("upload",),
