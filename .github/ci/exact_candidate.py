@@ -55,7 +55,7 @@ FILES = {"component": COMPONENT, "native-adapter": NATIVE,
 # Captured from the immutable reviewed test tree with the pinned pytest version.
 # Full readable inventories are retained with every run.
 INVENTORY_SHA = {
-    "component": "7ae5d34b2c228d9fe244c0e1d929cdb7085d2535691e7a5a0ec9a4d718e0f4a3",
+    "component": "4baa26e78df7f97a4819a03724a79d6bb3a441a8f968a6a3b50b22ad1b7855d5",
     "native-adapter": "040f799aba592ec5ee40991d6a78d6077ecde2e5b2fc909a38580edcf90765a5",
     "windows-ledger": "698d95967d1ee754e85d3980922d9232451641983bb91730ccfa4e5c2d690fab",
 }
