@@ -30,6 +30,11 @@ jobs:
       PYTHONUTF8: '0'
       UV_PYTHON_DOWNLOADS: never
       CANDIDATE_LANE: ${{ matrix.lane }}
+      # Windows Git defaults must not rewrite reviewed LF blobs to CRLF.
+      # Applies before checkout and to the explicit Streaming source clone.
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
