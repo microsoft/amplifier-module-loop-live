@@ -307,6 +307,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             try:
                 if registration_ready:
                     registration_ready()
+                await report_media_consumer_ready(coordinator)
                 result=await self._execute_guarded_goal(prompt, context, providers, tools, hooks, coordinator)
                 self.host.finite_finished(finite_scope, coordinator, "completed", result)
                 return result

@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -716,3 +717,193 @@ async def test_live_consumer_report_settles_before_readiness_with_terminal_clean
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await session.cleanup()
+
+
+@pytest.fixture
+def finite_media_execution(environment, monkeypatch):
+    """Real Core/streaming finite engine; synthetic host compatibility only."""
+    session, owner, loop, _ = environment
+    state = SimpleNamespace(order=[], reports=[], finished=[], media=Media(),
+                            shape="valid", asynchronous=False, paused=False,
+                            registration_error=None, report_error=None,
+                            entered=asyncio.Event(), release=asyncio.Event())
+    state.media.enabled = False
+    scope = object()
+
+    def report(origin, **kwargs):
+        state.reports.append((origin, kwargs))
+        state.order.append("consumer-ready")
+        assert state.order.count("registration-ready") == 1
+        assert not state.finished
+        if state.asynchronous:
+            async def settle():
+                state.entered.set()
+                if state.paused:
+                    await state.release.wait()
+                else:
+                    await asyncio.sleep(0)
+                if state.report_error:
+                    raise state.report_error
+                state.order.append("report-settled")
+                return {"authoritative": False}
+            return settle()
+        state.order.append("report-settled")
+        return {"authoritative": False}
+
+    state.media.report = report
+
+    class FiniteHost(HostAdapter):
+        @contextmanager
+        def execution_registration(self, coordinator, hooks):
+            state.order.append("registration-enter")
+            yield coordinator, hooks
+            state.order.append("registration-ready")
+            if state.registration_error:
+                raise state.registration_error
+            # The capability/boundary are only available after final registration.
+            if state.shape != "absent":
+                coordinator.register_capability(MEDIA, state.media)
+            if state.shape != "no-boundary":
+                coordinator.register_capability("session.media.tool_post",
+                    False if state.shape == "false-boundary" else
+                    lambda *a, **kw: pytest.fail("No speculative post-hook execution"))
+
+        async def prepare_execution(self, current, coordinator, providers):
+            assert current is loop and coordinator is owner
+            return None, providers, scope
+
+        def finite_finished(self, current_scope, coordinator, status, result=""):
+            assert current_scope is scope and coordinator is owner
+            state.finished.append((status, result))
+            state.order.append("finished:" + status)
+
+    class Provider:
+        name, config = "fixture", {}
+
+        def get_info(self):
+            return SimpleNamespace(default_model="fixture")
+
+        def parse_tool_calls(self, response):
+            return []
+
+        async def request_budget(self, request, **kwargs):
+            state.order.append("count")
+            return None  # Ordering control, not measured-fit/media qualification.
+
+        async def complete(self, request, **kwargs):
+            state.order.append("send")
+            return ChatResponse(content=[TextBlock(text="finite text result")])
+
+    goal = loop._execute_guarded_goal
+
+    async def observe_goal(*args):
+        state.order.append("goal")
+        return await goal(*args)
+
+    monkeypatch.setattr(loop, "_execute_guarded_goal", observe_goal)
+    owner.register_capability("live.host", FiniteHost())
+
+    async def execute(*, public_session=False):
+        if public_session:
+            await owner.mount("providers", Provider(), name="fixture")
+            return await session.execute("ordinary finite text")
+        return await loop.execute("ordinary finite text", owner.get("context"),
+                                  {"fixture": Provider()}, {}, owner.hooks, owner)
+
+    state.execute = execute
+    return state
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_finite_consumer_report_follows_registration_before_actual_goal(finite_media_execution, asynchronous):
+    state = finite_media_execution
+    state.asynchronous = asynchronous
+    assert await state.execute() == "finite text result"
+    assert state.order == ["registration-enter", "registration-ready", "consumer-ready",
+                           "report-settled", "goal", "count", "send", "finished:completed"]
+    assert state.reports == [("loop-live", {"event": "consumer-ready", "outcome": "ready",
+        "details": {"contract": 1, "role": "loop", "phase": "registered"}})]
+    assert state.finished == [("completed", "finite text result")]
+    assert state.media.enabled is False  # Compatibility is not graph authority.
+
+
+async def test_core_public_finite_session_reports_before_budget_count(finite_media_execution):
+    state = finite_media_execution
+    assert await state.execute(public_session=True) == "finite text result"
+    assert state.order == ["registration-enter", "registration-ready", "consumer-ready",
+                           "report-settled", "goal", "count", "send", "finished:completed"]
+    assert len(state.reports) == 1 and state.media.enabled is False
+    assert state.finished == [("completed", "finite text result")]
+
+
+@pytest.mark.parametrize("shape", ["absent", "bool-version", "missing-operation", "missing-report",
+                                   "no-boundary", "false-boundary"])
+async def test_finite_consumer_report_requires_capability_and_post_boundary(finite_media_execution, shape):
+    state = finite_media_execution
+    state.shape = shape
+    if shape == "bool-version":
+        state.media.version = True
+    elif shape == "missing-operation":
+        state.media.publish = None
+    elif shape == "missing-report":
+        state.media.report = None
+    assert await state.execute() == "finite text result"
+    assert state.reports == []
+    assert state.order == ["registration-enter", "registration-ready", "goal",
+                           "count", "send", "finished:completed"]
+    assert state.finished == [("completed", "finite text result")]
+    assert state.media.enabled is False
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_finite_registration_failure_never_reports_or_enters_goal(finite_media_execution, cancelled):
+    state = finite_media_execution
+    error = asyncio.CancelledError() if cancelled else RuntimeError("final registration refused")
+    state.registration_error = error
+    with pytest.raises(type(error)) as raised:
+        await state.execute()
+    assert raised.value is error
+    status = "cancelled" if cancelled else "error"
+    assert state.reports == [] and state.finished == [(status, "")]
+    assert state.order == ["registration-enter", "registration-ready", "finished:" + status]
+    assert state.media.enabled is False
+
+
+@pytest.mark.parametrize("outcome", ["release", "error", "cancel"])
+async def test_finite_consumer_report_settles_before_goal_with_single_cleanup(finite_media_execution, outcome):
+    state = finite_media_execution
+    state.asynchronous = state.paused = True
+    error = RuntimeError("compatibility report acknowledgment lost")
+    if outcome == "error":
+        state.report_error = error
+    task = asyncio.create_task(state.execute())
+    try:
+        await asyncio.wait_for(state.entered.wait(), 2)
+        assert state.order == ["registration-enter", "registration-ready", "consumer-ready"]
+        assert state.finished == []  # No goal, budget count, send or premature finish.
+        if outcome == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif outcome == "error":
+            state.release.set()
+            with pytest.raises(RuntimeError) as raised:
+                await task
+            assert raised.value is error
+        else:
+            state.release.set()
+            assert await task == "finite text result"
+        await asyncio.sleep(0)  # Terminal failure must not schedule execution/retry.
+        status = {"release": "completed", "error": "error", "cancel": "cancelled"}[outcome]
+        assert len(state.reports) == 1
+        assert state.finished == [(status, "finite text result" if outcome == "release" else "")]
+        prefix = ["registration-enter", "registration-ready", "consumer-ready"]
+        assert state.order == prefix + (
+            ["report-settled", "goal", "count", "send", "finished:completed"]
+            if outcome == "release" else ["finished:" + status])
+        assert state.media.enabled is False
+    finally:
+        state.release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
