@@ -5,6 +5,9 @@ on:
     branches: [main]
 permissions:
   contents: read
+env:
+  # Candidate-graph evidence only; LIVE #36 depends on unmerged STREAMING #79.
+  LOOP_STREAMING_CANDIDATE: git+https://github.com/microsoft/amplifier-module-loop-streaming@e83403c822308d20df5287bd56bb7cf37d33e906
 jobs:
   test:
     strategy:
@@ -25,6 +28,9 @@ jobs:
             'amplifier-core @ git+https://github.com/microsoft/amplifier-core@main' \
             'amplifier-module-loop-streaming @ git+https://github.com/microsoft/amplifier-module-loop-streaming@main' \
             'amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@main'
+          uv pip install --python .venv/bin/python --no-deps \
+            "amplifier-module-loop-streaming @ $LOOP_STREAMING_CANDIDATE"
+          .venv/bin/python -c 'import importlib.metadata as m, json, os; assert json.loads(m.distribution("amplifier-module-loop-streaming").read_text("direct_url.json"))["vcs_info"]["commit_id"] == os.environ["LOOP_STREAMING_CANDIDATE"].rsplit("@", 1)[1]'
       - run: uv run --no-sync pytest -q
       - run: uv build
       - name: Check installed wheel without application adapters
@@ -32,6 +38,9 @@ jobs:
           uv venv "$RUNNER_TEMP/loop-live-smoke"
           uv pip install --python "$RUNNER_TEMP/loop-live-smoke/bin/python" dist/*.whl \
             'amplifier-core @ git+https://github.com/microsoft/amplifier-core@main'
+          uv pip install --python "$RUNNER_TEMP/loop-live-smoke/bin/python" --no-deps \
+            "amplifier-module-loop-streaming @ $LOOP_STREAMING_CANDIDATE"
+          "$RUNNER_TEMP/loop-live-smoke/bin/python" -I -c 'import importlib.metadata as m, json, os; assert json.loads(m.distribution("amplifier-module-loop-streaming").read_text("direct_url.json"))["vcs_info"]["commit_id"] == os.environ["LOOP_STREAMING_CANDIDATE"].rsplit("@", 1)[1]'
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/loop-live-smoke/bin/python" -I -c 'from amplifier_module_loop_live import mount; from amplifier_module_loop_live.runtime import Runtime, Input; import sys; assert not any(name.startswith(("amplifier_app_cli", "amplifier_loop_live_cli", "amplifier_live", "amplifier_web")) for name in sys.modules)'
   windows-job-ledger:
@@ -75,6 +84,9 @@ jobs:
           uv pip install --python $python --only-binary amplifier-core `
             'amplifier-core==2.0.2' pytest $wheel
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv pip install --python $python --no-deps `
+            "amplifier-module-loop-streaming @ $env:LOOP_STREAMING_CANDIDATE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Require installed origin and actual native ledger checks without skips
         shell: pwsh
         run: |
@@ -89,6 +101,8 @@ jobs:
           from pathlib import Path
           import amplifier_module_loop_live
           from amplifier_module_loop_live import job_store
+          streaming = metadata.distribution("amplifier-module-loop-streaming")
+          assert json.loads(streaming.read_text("direct_url.json"))["vcs_info"]["commit_id"] == os.environ["LOOP_STREAMING_CANDIDATE"].rsplit("@", 1)[1]
           assert os.name == "nt" and sys.implementation.name == "cpython"
           assert sys.version_info[:2] == (3, 13) and struct.calcsize("P") == 8
           assert not sysconfig.get_config_var("Py_GIL_DISABLED")
@@ -149,6 +163,9 @@ jobs:
             'amplifier-module-loop-streaming @ git+https://github.com/microsoft/amplifier-module-loop-streaming@main' \
             'amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@main' \
             'amplifier-module-provider-openai[native] @ git+https://github.com/microsoft/amplifier-module-provider-openai@main'
+          uv pip install --python .venv/bin/python --no-deps \
+            "amplifier-module-loop-streaming @ $LOOP_STREAMING_CANDIDATE"
+          .venv/bin/python -c 'import importlib.metadata as m, json, os; assert json.loads(m.distribution("amplifier-module-loop-streaming").read_text("direct_url.json"))["vcs_info"]["commit_id"] == os.environ["LOOP_STREAMING_CANDIDATE"].rsplit("@", 1)[1]'
       - name: Require the native provider and verify adapter boundaries offline
         run: |
           uv run --no-sync python -c 'from amplifier_module_provider_openai.native import NativeResponsesProvider'
