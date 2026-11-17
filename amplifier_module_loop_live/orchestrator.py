@@ -15,6 +15,7 @@ from contextvars import ContextVar
 
 from amplifier_core import HookResult
 from amplifier_module_loop_streaming import StreamingOrchestrator, ConversationProviderPin
+from amplifier_module_loop_streaming.media import initialize_media_consumer
 from .runtime import Input, observation
 from .provenance import InputContext, ContinuationContext, input_metadata
 from .job_store import serialize_result
@@ -260,6 +261,9 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         if runtime is None:
             # CLI's production spawner expects a finite result from workers.
             try:
+                registration = getattr(self, "_media_consumer", None)
+                if registration is not None:
+                    await registration.refresh()
                 if registration_ready:
                     registration_ready()
                 result=await self._execute_guarded_goal(prompt, context, providers, tools, hooks, coordinator)
@@ -369,6 +373,9 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
         try:
             # Establish terminal cleanup before any late host mount can await.
             await self._mount_live_tools(tools, coordinator)
+            registration = getattr(self, "_media_consumer", None)
+            if registration is not None:
+                await registration.refresh()
             if registration_ready:
                 registration_ready()
             await runtime.emit("session.ready", mode="configured_bundle", native=bool(native),
@@ -729,3 +736,4 @@ async def mount(coordinator, config=None):
     coordinator.register_contributor("observability.events", "loop-live", lambda: [
         "execution:start", "execution:end", "orchestrator:steering_injected",
         "orchestrator:goal_progress", "orchestrator:budget_warning"])
+    await initialize_media_consumer(coordinator, loop, "loop-live")
