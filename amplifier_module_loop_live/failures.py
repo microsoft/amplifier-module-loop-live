@@ -58,6 +58,7 @@ def turn_failure(error, stage="manager_turn"):
                   "native_measurement_unavailable", "native_compaction_failed",
                   "disabled", "request_context_unavailable", "invalid_native_contract",
                   "authoritative_measurement_unavailable", "summary_output_limit", "summary_empty",
+                  "summary_work_paused", "summary_progress_incompatible",
                   "previous_failure", "summary_failed", "native_failed",
                   "native_recovery_required_context_oversized", "checkpoint_persist_failed"}
     count_failure = count_diagnostic(error)
@@ -67,6 +68,12 @@ def turn_failure(error, stage="manager_turn"):
     elif compaction:
         category, stage = "context_compaction", "context_preparation"
         message = "Context compaction failed. Original history is preserved; repair context preparation before continuing."
+        if isinstance(code, str) and code == "summary_work_paused":
+            message = ("Context preparation used its local work allowance. Completed checkpoint progress is retained. "
+                       "Further preparation requires separate admission; work was not automatically retried.")
+        elif isinstance(code, str) and code == "summary_progress_incompatible":
+            message = ("Saved paid summary progress is incompatible with the current source or policy. "
+                       "No replacement work was started; the checkpoint is preserved. An explicit decision is required.")
     elif isinstance(error, ContextLengthError):
         category = "context_limit"
         if local_context:
