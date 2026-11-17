@@ -90,15 +90,85 @@ def effective_selection(provider, providers, request=None, kwargs=None):
 class ObservedWorkerProvider:
     def __init__(self, original, providers, registry, identity):
         self.original, self.providers, self.registry, self.identity = original, providers, registry, identity
+        self.alias = None
+        self._request_candidate = None
+        self._media_release_candidate = None
+        for name in ("request_budget", "refit_request", "stream", "compact_context", "media_budget_witness",
+                     "media_text_fallback_witness", "release_media_request"):
+            if callable(getattr(original, name, None)):
+                setattr(self, name, getattr(self, "_" + name))
 
     def __getattr__(self, name):
+        if name == "release_media_request":
+            raise AttributeError(name)
         return getattr(self.original, name)
 
-    async def complete(self, request, **kwargs):
+    def _selection(self, request, kwargs):
         selected = effective_selection(self.original, self.providers, request, kwargs)
-        self.registry.configuration(self.identity, selected)
-        if request.tools and selected["provider"] not in {"openai","provider-openai"}:
-            from amplifier_core.message_models import ToolSpec
-            request=request.model_copy(update={"tools":[ToolSpec(name=t.name,parameters=t.parameters,description=t.description)
-                if getattr(t,"type","function")!="function" else t for t in request.tools]})
-        return await self.original.complete(request, **kwargs)
+        if self.alias is not None:
+            selected["instance"] = self.alias
+        return selected
+
+    def _request_view(self, request):
+        if not request.tools or self.original.get_info().id in {"openai", "provider-openai"}:
+            return request
+        if not any(getattr(tool, "type", "function") != "function" for tool in request.tools):
+            return request
+        cached, snapshot = self._request_candidate, request.model_dump()
+        if cached is not None and cached[0] is request and cached[1] == snapshot:
+            return cached[2]
+        from amplifier_core.message_models import ToolSpec
+        tools = [ToolSpec(name=t.name, parameters=t.parameters, description=t.description)
+                 if getattr(t, "type", "function") != "function" else t for t in request.tools]
+        view = request.model_copy(deep=True, update={"tools": tools})
+        self._request_candidate = (request, copy.deepcopy(snapshot), view)
+        return view
+
+    def _request_budget(self, request, *, request_options=None, **kwargs):
+        from amplifier_loop_live_cli.selection import optional_request_call
+        view, accept = self._prepare_request_view(request, request_options)
+        return optional_request_call(self.original.request_budget, view,
+                                     request_options=request_options, _accepted=accept, **kwargs)
+
+    def _refit_request(self, request, *, request_options=None, **kwargs):
+        from amplifier_loop_live_cli.selection import optional_request_call
+        view, accept = self._prepare_request_view(request, request_options)
+        return optional_request_call(self.original.refit_request, view,
+                                     request_options=request_options, _accepted=accept, **kwargs)
+
+    def _prepare_request_view(self, request, request_options):
+        view = self._request_view(request)
+        candidate = (request, view, copy.deepcopy(request_options or {}))
+        def accept():
+            self._media_release_candidate = candidate
+        return view, accept
+
+    def _compact_context(self, request, **kwargs):
+        return self.original.compact_context(self._request_view(request), **kwargs)
+
+    def _media_budget_witness(self, request, *, request_options=None):
+        from amplifier_loop_live_cli.selection import accepted_preparation
+        view, accept = self._prepare_request_view(request, request_options)
+        return accepted_preparation(self.original.media_budget_witness(view, request_options=request_options), accept)
+
+    def _media_text_fallback_witness(self, request, *, request_options=None):
+        from amplifier_loop_live_cli.selection import accepted_preparation
+        view, accept = self._prepare_request_view(request, request_options)
+        return accepted_preparation(self.original.media_text_fallback_witness(view, request_options=request_options), accept)
+
+    def _release_media_request(self, request, *, request_options=None):
+        candidate = self._media_release_candidate
+        if candidate is None or candidate[0] is not request or candidate[2] != (request_options or {}):
+            return False
+        result = self.original.release_media_request(candidate[1], request_options=copy.deepcopy(candidate[2]))
+        if result is True:
+            self._media_release_candidate = None
+        return result
+
+    def _stream(self, request, **kwargs):
+        self.registry.configuration(self.identity, self._selection(request, kwargs))
+        return self.original.stream(self._request_view(request), **kwargs)
+
+    async def complete(self, request, **kwargs):
+        self.registry.configuration(self.identity, self._selection(request, kwargs))
+        return await self.original.complete(self._request_view(request), **kwargs)

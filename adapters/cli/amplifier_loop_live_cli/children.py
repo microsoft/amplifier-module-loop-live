@@ -165,6 +165,11 @@ async def install(coordinator, runtime, settings=None, registry=None):
         coordinator.register_capability("session.spawn",recorded_spawn)
     delegate=(coordinator.get("tools") or {}).get("delegate")
     if delegate and not isinstance(delegate,PersistentDelegate):
-        await coordinator.mount("tools",PersistentDelegate(delegate,coordinator,registry),name="delegate")
+        wrapped = PersistentDelegate(delegate,coordinator,registry)
+        adapter_mount = getattr(coordinator, "mount_adapter", None)
+        if callable(adapter_mount):
+            await adapter_mount("tools", wrapped, previous=delegate, name="delegate")
+        else:
+            await coordinator.mount("tools", wrapped, name="delegate")
         await coordinator.mount("tools",WorkerControl(registry),name="live_worker")
     return registry

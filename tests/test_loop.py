@@ -68,6 +68,56 @@ class Delegate:
         return ToolResult(success=True, output={"report": "CHILD-RESULT"})
 
 class BundleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_busy_native_job_service_keeps_structured_evidence_on_boundary(self):
+        from test_job_media import carrier, MEDIA
+        await self.start(native=True)
+        await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
+        await self.provider.request()  # A genuinely active native request.
+        evidence = {"version": 1, "metadata": carrier()["metadata"]}
+        command = Input("service", "WORKER REPORT", id="structured-job",
+                        source="amplifier-delegate", call_id="call", job_result=evidence)
+        await self.runtime.submit(command)
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued"
+                                   and e["input_id"] == command.id, 3)
+        self.assertEqual(self.provider.steered, [])
+        self.tool.release.set()
+        await self.provider.reply(calls=[ToolCall(id="boundary", name="delegate", arguments={"async": False})])
+        request = await self.provider.request()
+        message = next(m for m in request.messages if (m.metadata or {}).get("amplifier_input", {}).get("id") == command.id)
+        self.assertEqual(message.metadata["live_job_result"], evidence)
+        self.assertNotIn(MEDIA, message.metadata)
+        self.assertEqual(message.metadata["amplifier_input"]["kind"], "service")
+        self.assertEqual(self.provider.steered, [])
+
+    async def test_async_attachment_encoder_keeps_fifo_native_barrier(self):
+        await self.start(native=True)
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def encode(command, coordinator):
+            entered.set()
+            await release.wait()
+            return command.text + "-ENCODED"
+        self.session.coordinator.register_capability("live.attachments.encode", encode)
+        await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
+        await self.provider.request()
+        await self.runtime.submit(Input("user", "FIRST", id="async-upload", attachments=("fixture",)))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued"
+                                   and e["input_id"] == "async-upload", 3)
+        self.tool.release.set()
+        await self.provider.reply(calls=[ToolCall(id="boundary", name="delegate", arguments={"async": False})])
+        await asyncio.wait_for(entered.wait(), 3)
+        await self.runtime.submit(Input("user", "SECOND", id="second"))
+        await self.runtime.wait_for(lambda e: e["type"] == "input.queued"
+                                   and e["input_id"] == "second", 3)
+        self.assertEqual(self.provider.steered, [])
+        self.assertEqual(self.loop.pending[0].id, "async-upload")
+        release.set()
+        first = await self.provider.request()
+        self.assertIn("FIRST-ENCODED", str(first.messages))
+        await self.provider.reply("first answer")
+        second = await self.provider.request()
+        self.assertLess(str(second.messages).index("FIRST-ENCODED"), str(second.messages).index("SECOND"))
+        self.assertEqual(self.provider.steered, [])
+
     async def test_ordinary_native_midstep_keeps_identity_and_provider_ownership(self):
         await self.start(native=True)
         await self.runtime.submit(Input("user", "ORIGINAL", id="original"))
