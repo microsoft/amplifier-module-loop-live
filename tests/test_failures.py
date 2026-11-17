@@ -11,6 +11,15 @@ from amplifier_module_loop_live.orchestrator import BundleLiveOrchestrator
 from amplifier_module_loop_live.runtime import Runtime
 
 
+def mount_inventory(coordinator):
+    tools = {}
+    async def mount(kind, tool, *, name):
+        assert kind == "tools"
+        tools[name] = tool
+    coordinator.mount = mount
+    coordinator.get = lambda kind: tools if kind == "tools" else None
+
+
 @pytest.mark.parametrize('error,category,stage', [
     (ContextLengthError('secret prompt and base64 data'), 'context_limit', 'manager_turn'),
     (ContextLengthError('private request', provider='fixture'), 'context_limit', 'provider_request'),
@@ -41,6 +50,7 @@ async def test_local_failure_keeps_cause_and_identity_without_provider_error_or_
     capabilities = {'live.runtime': runtime}
     coordinator = SimpleNamespace(get_capability=capabilities.get,
         register_capability=capabilities.__setitem__, config={})
+    mount_inventory(coordinator)
     hooks = SimpleNamespace(register=lambda *a, **kw: None,
         emit=AsyncMock(return_value=HookResult()))
     provider = SimpleNamespace(name='fixture', config={})
@@ -169,6 +179,7 @@ async def test_summary_pause_keeps_cause_and_input_identity_without_replay(code,
     capabilities = {'live.runtime': runtime}
     coordinator = SimpleNamespace(get_capability=capabilities.get,
         register_capability=capabilities.__setitem__, config={})
+    mount_inventory(coordinator)
     hooks = SimpleNamespace(register=lambda *a, **kw: None,
         emit=AsyncMock(return_value=HookResult()))
     provider = SimpleNamespace(name='fixture', config={}, complete=AsyncMock())

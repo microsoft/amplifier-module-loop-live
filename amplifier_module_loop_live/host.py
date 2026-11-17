@@ -1,7 +1,13 @@
 """Host extension points. The default needs only Amplifier's coordinator."""
 
+from contextlib import nullcontext
+
 
 class HostAdapter:
+    def execution_registration(self, coordinator, hooks):
+        """Let a host observe late mounts/hooks, closing before execution."""
+        return nullcontext((coordinator, hooks))
+
     async def prepare_execution(self, loop, coordinator, providers):
         runtime = coordinator.get_capability("live.runtime") if coordinator else None
         return runtime, providers, None
@@ -10,7 +16,8 @@ class HostAdapter:
         pass
 
     def prepare_provider(self, provider, coordinator):
-        pass
+        """Return a request-local view; legacy mutation-only hosts return None."""
+        return provider
 
     def content(self, command, coordinator):
         encode = coordinator.get_capability("live.attachments.encode") if coordinator else None

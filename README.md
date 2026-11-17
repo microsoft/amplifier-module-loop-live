@@ -57,6 +57,17 @@ approval policy, transport authentication, persistence location, and shutdown.
 Runtime history is bounded observation, not a replay log. Saved interrupted jobs
 are evidence and are never automatically dispatched again.
 
+For ordinary root tool media, the inherited STREAMING engine uses the host's
+optional refs-only settlement, final post-hook boundary and durable checkpoint.
+The host may return a request-local provider view from `prepare_provider`;
+returning `None` preserves legacy mutation-only adapters. `execution_registration`
+is an optional synchronous context manager yielding `(coordinator, hooks)`.
+It observes actual late LIVE hooks and public tool mounts, then closes before
+the first finite or live turn so a participating host can seal its hook graph.
+The default is a no-op, not a media-qualification witness. Hosts retain media
+enablement, final-hook qualification, checkpoint acknowledgment and teardown.
+This does not add background-job media, child forwarding or CLI integration.
+
 If a provider, hook, or host guard cancels an active turn, the live owner settles
 through the same cancellation cleanup as Stop. It emits `generation.detached`
 with cancellation unconfirmed and `session.closed` with cancelled status; it
