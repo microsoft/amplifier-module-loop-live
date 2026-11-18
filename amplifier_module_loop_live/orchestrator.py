@@ -10,10 +10,12 @@ import asyncio
 import json
 import uuid
 from collections import deque
+from contextlib import ExitStack
 from contextvars import ContextVar
 
 from amplifier_core import HookResult
 from amplifier_module_loop_streaming import StreamingOrchestrator, ConversationProviderPin
+from amplifier_module_loop_streaming.media import initialize_media_consumer
 from .runtime import Input, observation
 from .provenance import InputContext, ContinuationContext, input_metadata
 from .job_store import serialize_result
@@ -193,17 +195,77 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
     async def execute(self, prompt, context, providers, tools, hooks, coordinator=None):
         self.host = (coordinator.get_capability("live.host") if coordinator else None) or HOST_ADAPTER.get() or HostAdapter()
         token = HOST_ADAPTER.set(self.host)
+        original_root = self.root_provider
         try:
-            runtime, providers, finite_scope = await self.host.prepare_execution(self, coordinator, providers)
-            with self.approved_dispatch.run_scope(coordinator):
-                return await self._execute_live(prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope)
+            with ExitStack() as registration:
+                coordinator, hooks = registration.enter_context(
+                    self.host.execution_registration(coordinator, hooks))
+                runtime, providers, finite_scope = await self.host.prepare_execution(self, coordinator, providers)
+                with self.approved_dispatch.run_scope(coordinator):
+                    return await self._execute_live(
+                        prompt, context, providers, tools, hooks, coordinator,
+                        runtime, finite_scope, registration.close)
         finally:
+            self.root_provider = original_root
             HOST_ADAPTER.reset(token)
 
-    async def _execute_live(self, prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope):
+    async def _mount_live_tools(self, tools, coordinator):
+        from .jobs import AsyncTool, JobControl
+        eligible = set(self.config.get("background_tools", ["delegate"]))
+        adapter_mount = getattr(coordinator, "mount_adapter", None)
+        for name in eligible.intersection(tools):
+            if not isinstance(tools[name], AsyncTool):
+                wrapped = AsyncTool(tools[name])
+                if callable(adapter_mount):
+                    await adapter_mount("tools", wrapped, previous=tools[name], name=name)
+                else:
+                    await coordinator.mount("tools", wrapped, name=name)
+                tools[name] = self._installed_tool(coordinator, name)
+        job_control = JobControl(self)
+        if "live_job" in tools and callable(adapter_mount):
+            await adapter_mount("tools", job_control, previous=tools["live_job"], name="live_job")
+        else:
+            await coordinator.mount("tools", job_control, name="live_job")
+        tools["live_job"] = self._installed_tool(coordinator, "live_job")
+
+    @staticmethod
+    def _installed_tool(coordinator, name):
+        installed = coordinator.get("tools")
+        if not isinstance(installed, dict) or name not in installed:
+            raise RuntimeError("Live tool mount was not acknowledged in the canonical inventory")
+        return installed[name]
+
+    async def _execute_live(self, prompt, context, providers, tools, hooks, coordinator, runtime, finite_scope,
+                            registration_ready=None):
+        # Prepare selected aliases before either finite or live dispatch. A
+        # request-local host view must not mutate shared provider mounts.
+        try:
+            prepared, views = {}, {}
+            for name, provider in providers.items():
+                if id(provider) not in views:
+                    view = self.host.prepare_provider(provider, coordinator)
+                    views[id(provider)] = provider if view is None else view
+                prepared[name] = views[id(provider)]
+            if self.root_provider is not None:
+                if id(self.root_provider) in views:
+                    self.root_provider = views[id(self.root_provider)]
+                else:
+                    view = self.host.prepare_provider(self.root_provider, coordinator)
+                    if view is not None:
+                        self.root_provider = view
+            providers = prepared
+        except BaseException as exc:
+            self.host.finite_finished(finite_scope, coordinator,
+                                     "cancelled" if isinstance(exc, asyncio.CancelledError) else "error")
+            raise
         if runtime is None:
             # CLI's production spawner expects a finite result from workers.
             try:
+                registration = getattr(self, "_media_consumer", None)
+                if registration is not None:
+                    await registration.refresh()
+                if registration_ready:
+                    registration_ready()
                 result=await self._execute_guarded_goal(prompt, context, providers, tools, hooks, coordinator)
                 self.host.finite_finished(finite_scope, coordinator, "completed", result)
                 return result
@@ -220,12 +282,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             activation.reset(token)
         self.running, self.runtime = True, runtime
         self.context, self.tools, self.hooks, self.coordinator = context, tools, hooks, coordinator
-        from .jobs import AsyncTool, JobControl
-        eligible = set(self.config.get("background_tools", ["delegate"]))
-        for name in eligible.intersection(tools):
-            if not isinstance(tools[name], AsyncTool):
-                tools[name] = AsyncTool(tools[name])
-        tools["live_job"] = JobControl(self)
         coordinator.register_capability("context.active_operations", lambda: [
             {"job_id": identity, "call_id": job["call_id"], "status": job.get("status", "pending"),
              "tool": (job.get("tool_call") or {}).get("name")}
@@ -240,7 +296,6 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                                              "recovered": row["job_id"] in recovered}
         from .scope import LIVE_OWNER
         native = self._select_provider(providers)
-        self.host.prepare_provider(native, coordinator)
         native = native if getattr(native, "native_bundle_live", False) else None
         runtime.anchored_steering_mode = "unavailable" if native else "request_boundary"
         runtime.steering_wake = lambda: self.steer(_WAKE)
@@ -316,6 +371,13 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 LIVE_OWNER.reset(owner_token)
 
         try:
+            # Establish terminal cleanup before any late host mount can await.
+            await self._mount_live_tools(tools, coordinator)
+            registration = getattr(self, "_media_consumer", None)
+            if registration is not None:
+                await registration.refresh()
+            if registration_ready:
+                registration_ready()
             await runtime.emit("session.ready", mode="configured_bundle", native=bool(native),
                 steering="native" if native else "request_boundary", async_tools="native" if native else "delegate_job_handles" if
                 self.config.get("background_delegate") else "none",
@@ -674,3 +736,4 @@ async def mount(coordinator, config=None):
     coordinator.register_contributor("observability.events", "loop-live", lambda: [
         "execution:start", "execution:end", "orchestrator:steering_injected",
         "orchestrator:goal_progress", "orchestrator:budget_warning"])
+    await initialize_media_consumer(coordinator, loop, "loop-live")
