@@ -16,8 +16,10 @@ from amplifier_core.llm_errors import (
 
 def count_diagnostic(error):
     """Recognize an optional provider contract without importing its SDK."""
-    if (type(error).__module__, type(error).__name__) != (
-            'amplifier_module_provider_openai._token_count', 'TokenCountError'):
+    if (type(error).__module__, type(error).__name__) not in {
+            ('amplifier_module_provider_openai._token_count', 'TokenCountError'),
+            ('amplifier_module_provider_anthropic', 'TokenCountError'),
+            ('amplifier_module_loop_streaming', 'RequestMeasurementUnavailable')}:
         return None
     value = getattr(error, 'count_failure', None)
     if not isinstance(value, dict):
