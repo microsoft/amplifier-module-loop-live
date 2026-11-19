@@ -202,9 +202,14 @@ async def test_summary_pause_keeps_cause_and_input_identity_without_replay(code,
     provider.complete.assert_not_awaited()
 
 
-def test_token_count_failure_has_safe_diagnostic_without_generation_retry():
+@pytest.mark.parametrize('module, error_name', [
+    ('amplifier_module_provider_openai._token_count', 'TokenCountError'),
+    ('amplifier_module_provider_anthropic', 'TokenCountError'),
+    ('amplifier_module_loop_streaming', 'RequestMeasurementUnavailable'),
+])
+def test_token_count_failure_has_safe_diagnostic_without_generation_retry(module, error_name):
     from amplifier_core.llm_errors import LLMError
-    cls = type('TokenCountError', (LLMError,), {'__module__': 'amplifier_module_provider_openai._token_count'})
+    cls = type(error_name, (LLMError,), {'__module__': module})
     error = cls('private SDK body', provider='openai', retryable=False)
     error.count_failure = {'category': 'service', 'retryable': True, 'httpStatus': 503,
                            'attempts': 3, 'requestId': 'req_123', 'body': 'SECRET'}
