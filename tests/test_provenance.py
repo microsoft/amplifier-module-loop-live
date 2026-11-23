@@ -35,7 +35,7 @@ async def test_new_turn_uses_tagged_context_before_engine_writes(monkeypatch):
         saved.set();return 'done'
     monkeypatch.setattr(StreamingOrchestrator,'execute',finite)
     capabilities={'live.runtime':runtime}
-    coordinator=SimpleNamespace(get_capability=capabilities.get,register_capability=lambda name,value:capabilities.__setitem__(name,value),config={})
+    coordinator=SimpleNamespace(get_capability=capabilities.get,register_capability=lambda name,value:capabilities.__setitem__(name,value),config={},cancellation=SimpleNamespace(is_cancelled=False))
     tools = {}
     async def mount(kind, tool, *, name):
         assert kind == "tools"
