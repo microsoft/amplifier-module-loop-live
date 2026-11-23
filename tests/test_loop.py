@@ -16,7 +16,7 @@ from amplifier_core import AmplifierSession, HookResult, ToolResult, ApprovalReq
 
 from amplifier_core.message_models import ChatResponse, TextBlock, ToolCall
 
-from amplifier_module_loop_live.runtime import Runtime, Input
+from amplifier_module_loop_live.runtime import Runtime, Input, InputBusyError
 
 class Provider:
     name = "fixture"
@@ -68,6 +68,58 @@ class Delegate:
         return ToolResult(success=True, output={"report": "CHILD-RESULT"})
 
 class BundleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_only_input_rejects_dequeued_observation_before_generation(self):
+        await self.start()
+        await self.runtime.wait_for(lambda e: e["type"] == "session.idle", 3)
+        await self.runtime.submit(Input("service", "Prior work", source="fixture", id="prior"))
+        follow = Input("user", "Follow-up", id="follow", only_if_idle=True)
+        # Hold the real observer boundary after dequeue and before accepting
+        # the prior work for generation. All public idle counters look empty.
+        async with self.runtime.changed:
+            await asyncio.sleep(0)
+            self.assertEqual(self.runtime.events[-1]["type"], "observation.received")
+            self.assertIsNone(self.runtime.generation)
+            self.assertEqual(self.runtime.queued_inputs, 0)
+            self.assertTrue(self.runtime.inbox.empty())
+            self.assertFalse(self.loop.pending)
+            with self.assertRaises(InputBusyError):
+                await self.runtime.submit(follow)
+            self.assertNotIn(follow.id, self.runtime.accepted)
+        await self.provider.request()
+        with self.assertRaises(InputBusyError):
+            await self.runtime.submit(follow)
+        await self.provider.reply("First answer")
+        await self.runtime.wait_for(
+            lambda e: e["type"] == "session.idle" and e.get("text") == "First answer", 3
+        )
+        await self.runtime.submit(follow)
+        request = await self.provider.request()
+        self.assertIn("Follow-up", str(request.messages))
+        self.assertEqual(self.runtime.generation["initial_input_id"], follow.id)
+        await self.provider.reply("Second answer")
+
+    async def test_idle_only_submit_reserves_before_a_competing_submit(self):
+        await self.start()
+        await self.runtime.wait_for(lambda e: e["type"] == "session.idle", 3)
+        first = Input("user", "First", id="first", only_if_idle=True)
+        second = Input("user", "Second", id="second", only_if_idle=True)
+        async with self.runtime.changed:
+            claiming = asyncio.create_task(self.runtime.submit(first))
+            try:
+                await asyncio.sleep(0)
+                self.assertIs(self.runtime.accepted[first.id], first)
+                self.assertFalse(claiming.done())
+                self.assertEqual(await self.runtime.submit(first), first.id)
+                with self.assertRaises(InputBusyError):
+                    await self.runtime.submit(second)
+                self.assertNotIn(second.id, self.runtime.accepted)
+            finally:
+                claiming.cancel()
+                await asyncio.gather(claiming, return_exceptions=True)
+        await self.provider.request()
+        self.assertEqual(self.runtime.generation["initial_input_id"], first.id)
+        await self.provider.reply("Done")
+
     async def test_ordinary_native_midstep_keeps_identity_and_provider_ownership(self):
         await self.start(native=True)
         await self.runtime.submit(Input("user", "ORIGINAL", id="original"))

@@ -23,6 +23,12 @@ class Input:
     activation: object | None = field(default=None, compare=False, repr=False)
     # Opt-in: this steering input may affect only the named generation.
     target_generation_id: str | None = None
+    # Admit only at the owner's native idle boundary; never steer an older turn.
+    only_if_idle: bool = False
+
+
+class InputBusyError(RuntimeError):
+    """No input was reserved: a separate turn cannot start at this boundary."""
 
 
 class _Event(tuple):
@@ -69,6 +75,8 @@ class Runtime:
         self.steering_wake = None
         self.steering_closed = False
         self.stop_requested = False
+        self._owner_waiting = False
+        self._has_active_jobs = None
 
     async def submit(self, command: Input):
         if self.closed:
@@ -87,6 +95,9 @@ class Runtime:
             raise ValueError("Service observations need a distinct source")
         if command.attachments and command.kind not in {"user", "steer"}:
             raise ValueError("Attachments require a user work message")
+        if type(command.only_if_idle) is not bool or (
+                command.only_if_idle and command.kind != "user"):
+            raise ValueError("Idle-only admission requires an ordinary user input")
         previous = self.accepted.get(command.id)
         if previous:
             if previous != command:
@@ -108,6 +119,14 @@ class Runtime:
             raise RuntimeError("Session input limit reached; start a new session")
         if self.queued_inputs + len(self.pending_steering) >= 128:
             raise asyncio.QueueFull()
+        if command.only_if_idle and not (
+                self._owner_waiting and self._has_active_jobs is not None
+                and self.generation is None and not self.queued_inputs
+                and not self.pending_steering and self.inbox.empty()
+                and not self._has_active_jobs()):
+            raise InputBusyError("The session is not at an idle input boundary")
+        # No suspension between testing the native boundary and reserving the
+        # inbox slot/identity. A competing submission sees the reservation.
         direct = command.target_generation_id is not None and self.steering_wake is not None
         if direct:
             # Admission and the request-boundary queue share one synchronous

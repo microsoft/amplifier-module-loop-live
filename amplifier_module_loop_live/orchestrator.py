@@ -388,6 +388,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                                        status=job["status"], outcome="saved_evidence")
             if prompt:
                 self.pending.append(Input("user", prompt))
+            runtime._has_active_jobs = self._active_jobs
             while True:
                 if active is None and self.pending:
                     await self._hold_anchored("generation-ended")
@@ -403,7 +404,16 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
                 if active is None and not self.pending and not self._active_jobs() and runtime.inbox.empty() and not idle:
                     idle = True
                     await runtime.emit("session.idle", text=last)
-                event = await runtime.inbox.get()
+                # Only this receive boundary owns idle admission. In particular,
+                # moving an input from inbox to pending does not make us idle.
+                runtime._owner_waiting = (
+                    active is None and not self.pending and not self._boundary_pending
+                    and not coordinator.cancellation.is_cancelled
+                )
+                try:
+                    event = await runtime.inbox.get()
+                finally:
+                    runtime._owner_waiting = False
                 kind, value = event
                 if kind == "child_event":
                     # Public status is observation, not admission to execute or
@@ -564,6 +574,7 @@ class BundleLiveOrchestrator(StreamingOrchestrator):
             raise
         finally:
             runtime.closed = True
+            runtime._has_active_jobs = None
             runtime.steering_wake = None
             if active:
                 active.cancel()
