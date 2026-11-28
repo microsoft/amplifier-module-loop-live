@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -9,6 +10,19 @@ from amplifier_core.llm_errors import AuthenticationError, ContextLengthError, L
 from amplifier_module_loop_live.failures import ManagerTurnError, turn_failure
 from amplifier_module_loop_live.orchestrator import BundleLiveOrchestrator
 from amplifier_module_loop_live.runtime import Runtime
+
+
+class CompactionError(RuntimeError):
+    def __str__(self):
+        raise AssertionError("Exception text must remain private")
+
+
+@pytest.fixture(autouse=True)
+def optional_context_error(monkeypatch):
+    # This is the optional module's exported class. A same-name class below is
+    # not that export. Do not require Context or any provider SDK in loop tests.
+    monkeypatch.setitem(sys.modules, 'amplifier_module_context_managed.errors',
+                        SimpleNamespace(CompactionError=CompactionError))
 
 
 def mount_inventory(coordinator):
@@ -74,11 +88,10 @@ async def test_local_failure_keeps_cause_and_identity_without_provider_error_or_
     'disabled', 'request_context_unavailable', 'invalid_native_contract',
     'authoritative_measurement_unavailable', 'summary_output_limit', 'summary_empty',
     'native_recovery_required_context_oversized', 'checkpoint_persist_failed',
-    'previous_failure', 'summary_failed', 'native_failed', 'private payload', {'secret': 'value'}])
+    'previous_failure', 'summary_failed', 'native_failed', 'model_transition_required',
+    'future_context_code', 'a' * 80, 'private payload', {'secret': 'value'}])
 def test_compaction_failure_preserves_bounded_code_without_optional_dependency(code):
-    error_class = type('CompactionError', (RuntimeError,), {
-        '__module__': 'amplifier_module_context_managed.errors'})
-    error = error_class('secret transcript and SDK response')
+    error = CompactionError('secret transcript and SDK response')
     error.code = code
     failure = turn_failure(error)
     assert failure['error_category'] == 'context_compaction'
@@ -101,12 +114,7 @@ SUMMARY_PAUSE_MESSAGES = [
 
 
 def compaction_pause(code):
-    def forbidden_str(self):
-        raise AssertionError('Exception text must remain private')
-
-    error_class = type('CompactionError', (RuntimeError,), {
-        '__module__': 'amplifier_module_context_managed.errors', '__str__': forbidden_str})
-    error = error_class('SECRET transcript, credential, path and SDK response')
+    error = CompactionError('SECRET transcript, credential, path and SDK response')
     error.code = code
     error.retryable = True  # Arbitrary exception attributes cannot authorize retries.
     error.details = {'body': 'SECRET', 'source': 'SECRET', 'policy': 'SECRET'}
@@ -133,6 +141,7 @@ def test_summary_pause_has_static_safe_nonretryable_failure(code, message):
 @pytest.mark.parametrize('module,name', [
     ('untrusted.errors', 'CompactionError'),
     ('amplifier_module_context_managed.errors', 'OtherError'),
+    ('amplifier_module_context_managed.errors', 'CompactionError'),
 ])
 def test_summary_pause_rejects_wrong_exception_identity(code, module, name):
     error = type(name, (RuntimeError,), {'__module__': module})('SECRET')
@@ -157,7 +166,8 @@ def test_summary_pause_does_not_accept_compaction_subclass(code):
     assert 'SECRET' not in json.dumps(failure)
 
 
-@pytest.mark.parametrize('code', ['summary_work_paused:SECRET', 'unknown', None, [], {'SECRET': True}])
+@pytest.mark.parametrize('code', ['summary_work_paused:SECRET', 'Upper', 'bad\n', 'a' * 81,
+                                  '', 'a1', None, [], {'SECRET': True}])
 def test_summary_pause_rejects_unknown_or_malformed_code(code):
     failure = turn_failure(compaction_pause(code))
     assert 'error_code' not in failure
